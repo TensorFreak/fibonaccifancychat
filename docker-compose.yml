@@ -1,0 +1,77 @@
+# Ключевая идея деплоя: ОДИН образ, но РАЗНЫЕ процессы (разные command).
+# api и worker масштабируются независимо (deploy.replicas / --scale).
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: chat
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # healthcheck: миграции и приложение ждут, пока БД реально примет соединения.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d chat"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+
+  # Одноразовый шаг: применяет миграции БД и завершается. Схема больше НЕ грузится
+  # через initdb — источник истины схемы это migrations/ (см. app/migrate.py).
+  migrate:
+    build: .
+    command: python -m app.migrate
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Исполнитель №1: FastAPI. Отдаёт веб-страницы, регистрацию/вход, вебсокеты.
+  # На общем сервере коллеги заходят на http://<IP-сервера>:8000 .
+  # Для домена с HTTPS поставьте перед api reverse-proxy (Caddy/nginx) с TLS —
+  # тогда страница на https:// автоматически откроет wss:// (см. chat.html).
+  api:
+    build: .
+    # --proxy-headers: за reverse-proxy доверяем X-Forwarded-* (правильные scheme/IP).
+    command: ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000",
+              "--proxy-headers", "--forwarded-allow-ips", "*"]
+    env_file: .env
+    ports: ["8000:8000"]
+    depends_on:
+      redis:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+    # Масштабирование api за прокси (фикс. host-порт снять): --scale api=3
+
+  # Исполнитель №2: LLM-воркер. Consumer group, ходит к модели, пишет в Postgres.
+  worker:
+    build: .
+    command: python -m app.workers.llm_worker
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+    # scale: docker compose up --scale worker=4  (все в одной consumer group)
+
+  # Исполнитель №3: суммаризатор. Своя очередь chat:summarize, своя группа.
+  # Сворачивает старую часть диалога в summary, не мешая горячему пути.
+  summarizer:
+    build: .
+    command: python -m app.workers.summarizer
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:

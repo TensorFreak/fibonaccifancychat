@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chat</title>
+<style>
+  :root { color-scheme: light dark;
+    --bg:#0f1115; --fg:#e8eaed; --panel:#141821; --line:#232833; --muted:#8b93a1;
+    --row:#1a1e26; --rowh:#232a36; --active:#2a3140; --accent:#3b82f6; --asst:#1e232d; }
+  @media (prefers-color-scheme: light){ :root{
+    --bg:#f4f5f7; --fg:#1c1e21; --panel:#fff; --line:#e4e7ec; --muted:#6b7280;
+    --row:#fff; --rowh:#eef1f5; --active:#e6ebf3; --accent:#3b82f6; --asst:#fff; } }
+  * { box-sizing: border-box; }
+  html,body { height:100%; margin:0; }
+  body { font-family: system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+         background:var(--bg); color:var(--fg); display:flex; }
+  button { font:inherit; cursor:pointer; }
+
+  /* ---- Сайдбар ---- */
+  #sidebar { width:270px; flex-shrink:0; background:var(--panel); border-right:1px solid var(--line);
+             display:flex; flex-direction:column; }
+  #sidebar .top { padding:12px; }
+  #newBtn { width:100%; padding:10px; border:1px solid var(--line); border-radius:10px;
+            background:var(--row); color:inherit; font-size:14px; text-align:left; }
+  #newBtn:hover { background:var(--rowh); }
+  #chatlist { flex:1; overflow-y:auto; padding:4px 8px 8px; }
+  .group { font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted);
+           padding:12px 8px 4px; }
+  .chat { padding:9px 10px; border-radius:8px; font-size:14px; white-space:nowrap; overflow:hidden;
+          text-overflow:ellipsis; color:inherit; }
+  .chat:hover { background:var(--rowh); }
+  .chat.active { background:var(--active); }
+  .chat.untitled { color:var(--muted); font-style:italic; }
+  #moreBtn { width:calc(100% - 16px); margin:8px; padding:8px; border:1px dashed var(--line);
+             border-radius:8px; background:transparent; color:var(--muted); font-size:13px; }
+  #sidebar .bottom { border-top:1px solid var(--line); padding:10px 12px; display:flex;
+                     align-items:center; gap:8px; font-size:13px; }
+  #sidebar .bottom .email { flex:1; overflow:hidden; text-overflow:ellipsis; color:var(--muted); }
+  #logout { padding:6px 10px; border:1px solid var(--line); border-radius:8px;
+            background:var(--row); color:inherit; font-size:12px; }
+
+  /* ---- Основная область ---- */
+  #main { flex:1; display:flex; flex-direction:column; min-width:0; }
+  #topbar { display:flex; align-items:center; gap:10px; padding:12px 16px; border-bottom:1px solid var(--line); }
+  #burger { display:none; border:0; background:transparent; color:inherit; font-size:20px; }
+  #title { font-size:15px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #status { margin-left:auto; font-size:12px; padding:2px 10px; border-radius:20px; background:var(--row); }
+  #status.on { color:#4ade80; } #status.off { color:#f87171; }
+  #log { flex:1; overflow-y:auto; padding:20px; display:flex; flex-direction:column; gap:12px; }
+  .bubble { max-width:min(720px,86%); padding:10px 14px; border-radius:14px; white-space:pre-wrap;
+            line-height:1.45; font-size:15px; }
+  .user { align-self:flex-end; background:var(--accent); color:#fff; border-bottom-right-radius:4px; }
+  .assistant { align-self:flex-start; background:var(--asst); border-bottom-left-radius:4px; }
+  @media (prefers-color-scheme: light){ .assistant{ border:1px solid var(--line); } }
+  .assistant.pending::after { content:"▍"; opacity:.5; }
+  .sys { align-self:center; font-size:12px; color:var(--muted); }
+  #composer { display:flex; gap:8px; padding:14px 16px; border-top:1px solid var(--line); }
+  #text { flex:1; padding:11px 14px; border-radius:12px; border:1px solid var(--line);
+          background:var(--panel); color:inherit; font-size:15px; resize:none; max-height:160px; }
+  #send { padding:0 18px; border:0; border-radius:12px; background:var(--accent); color:#fff; font-size:16px; }
+  #send:disabled { opacity:.5; }
+
+  @media (max-width:640px){
+    #sidebar { position:fixed; z-index:10; height:100%; transform:translateX(-100%);
+               transition:transform .2s; box-shadow:2px 0 20px rgba(0,0,0,.3); }
+    #sidebar.open { transform:none; }
+    #burger { display:block; }
+  }
+</style>
+</head>
+<body>
+  <aside id="sidebar">
+    <div class="top"><button id="newBtn">＋  Новый чат</button></div>
+    <div id="chatlist"></div>
+    <div class="bottom">
+      <span class="email" id="who"></span>
+      <button id="logout">Выйти</button>
+    </div>
+  </aside>
+
+  <div id="main">
+    <div id="topbar">
+      <button id="burger" title="Меню">☰</button>
+      <span id="title">Новый чат</span>
+      <span id="status" class="off">оффлайн</span>
+    </div>
+    <div id="log"></div>
+    <div id="composer">
+      <textarea id="text" rows="1" placeholder="Сообщение…  (Enter — отправить, Shift+Enter — перенос)"></textarea>
+      <button id="send">→</button>
+    </div>
+  </div>
+
+<script>
+const token = localStorage.getItem("token");
+if(!token){ location.href = "/"; }
+const $ = (id) => document.getElementById(id);
+$("who").textContent = localStorage.getItem("email") || "";
+
+// ---- состояние ----
+let ws = null, activeId = null;
+let oldestCursor = null, loadingOlder = false;      // message_cursor (прокрутка вверх)
+let chatCursor = null, chatHasMore = false, loadingChats = false;  // chat_cursor
+let items = [];                                     // [{id, title, created_at}]
+const bubbles = {};                                 // message_id -> элемент бабла
+
+function authHeaders(){ return {"Authorization":"Bearer "+token, "Content-Type":"application/json"}; }
+async function api(path, opts={}){
+  const res = await fetch(path, {headers: authHeaders(), ...opts});
+  if(res.status === 401){ logout(); throw new Error("unauthorized"); }
+  return res.json();
+}
+function logout(){ localStorage.removeItem("token"); localStorage.removeItem("email"); location.href="/"; }
+$("logout").onclick = logout;
+
+// ======== САЙДБАР ========
+function bucket(iso){
+  const d = new Date(iso), now = new Date();
+  const day = new Date(d.getFullYear(),d.getMonth(),d.getDate());
+  const today = new Date(now.getFullYear(),now.getMonth(),now.getDate());
+  const diff = Math.round((today - day)/86400000);
+  if(diff <= 0) return "Сегодня";
+  if(diff === 1) return "Вчера";
+  if(diff < 7) return "На неделе";
+  return "Ранее";
+}
+function renderSidebar(){
+  const list = $("chatlist"); list.innerHTML = "";
+  let lastGroup = null;
+  for(const it of items){
+    const g = bucket(it.created_at);
+    if(g !== lastGroup){
+      const h = document.createElement("div"); h.className="group"; h.textContent=g;
+      list.appendChild(h); lastGroup = g;
+    }
+    const row = document.createElement("div");
+    row.className = "chat" + (it.id===activeId?" active":"") + (it.title?"":" untitled");
+    row.textContent = it.title || "Новый чат";
+    row.title = it.title || "Новый чат";
+    row.dataset.id = it.id;
+    row.onclick = () => { selectChat(it.id); $("sidebar").classList.remove("open"); };
+    list.appendChild(row);
+  }
+  if(chatHasMore){
+    const more = document.createElement("button");
+    more.id="moreBtn"; more.textContent="Показать ещё";
+    more.onclick = loadMoreChats;
+    list.appendChild(more);
+  }
+}
+async function loadChatsFirst(){
+  const res = await api("/api/conversations");
+  items = res.conversations; chatCursor = res.next_cursor; chatHasMore = res.has_more;
+  renderSidebar();
+}
+async function loadMoreChats(){
+  if(loadingChats || !chatCursor) return;
+  loadingChats = true;
+  try{
+    const res = await api("/api/conversations?cursor="+encodeURIComponent(chatCursor));
+    items = items.concat(res.conversations);
+    chatCursor = res.next_cursor; chatHasMore = res.has_more;
+    renderSidebar();
+  } finally { loadingChats = false; }
+}
+// обновить названия (после авто-генерации заголовка нового чата)
+async function refreshTitles(){
+  try{
+    const res = await api("/api/conversations");
+    const byId = Object.fromEntries(res.conversations.map(c => [c.id, c.title]));
+    let changed = false;
+    for(const it of items){ if(it.id in byId && it.title !== byId[it.id]){ it.title = byId[it.id]; changed = true; } }
+    if(changed){ renderSidebar(); if(activeId && byId[activeId]) $("title").textContent = byId[activeId] || "Новый чат"; }
+  }catch(e){}
+}
+function scheduleTitleRefresh(){ setTimeout(refreshTitles, 1800); setTimeout(refreshTitles, 4500); }
+
+async function newChat(){
+  const {id} = await api("/api/conversations", {method:"POST"});
+  items.unshift({id, title:null, created_at:new Date().toISOString()});
+  renderSidebar();
+  selectChat(id);
+}
+$("newBtn").onclick = newChat;
+$("burger").onclick = () => $("sidebar").classList.toggle("open");
+
+function selectChat(id){
+  activeId = id;
+  const it = items.find(x => x.id===id);
+  $("title").textContent = (it && it.title) || "Новый чат";
+  renderSidebar();
+  loadHistory(id);
+  connect(id);
+}
+
+// ======== СООБЩЕНИЯ ========
+function addBubble(cls, text){
+  const el = document.createElement("div");
+  el.className = "bubble " + cls; el.textContent = text || "";
+  $("log").appendChild(el); scrollDown();
+  return el;
+}
+function scrollDown(){ $("log").scrollTop = $("log").scrollHeight; }
+
+async function loadHistory(id){
+  $("log").innerHTML = "";
+  for(const k in bubbles) delete bubbles[k];
+  oldestCursor = null; loadingOlder = false;
+  try{
+    const res = await api("/api/conversations/"+id+"/messages");
+    for(const m of res.messages){ addBubble(m.role==="user"?"user":"assistant", m.content); }
+    oldestCursor = res.next_cursor;
+  }catch(e){ /* новый чат без истории */ }
+}
+async function loadOlder(){
+  if(loadingOlder || !oldestCursor) return;
+  loadingOlder = true;
+  const log = $("log"), prevH = log.scrollHeight;
+  try{
+    const res = await api("/api/conversations/"+activeId+"/messages?before="+oldestCursor);
+    const frag = document.createDocumentFragment();
+    for(const m of res.messages){
+      const el = document.createElement("div");
+      el.className = "bubble " + (m.role==="user"?"user":"assistant");
+      el.textContent = m.content; frag.appendChild(el);
+    }
+    log.insertBefore(frag, log.firstChild);
+    oldestCursor = res.next_cursor;
+    log.scrollTop = log.scrollHeight - prevH;   // сохранить позицию
+  } finally { loadingOlder = false; }
+}
+$("log").addEventListener("scroll", ()=>{ if($("log").scrollTop < 40) loadOlder(); });
+
+// ======== ВЕБСОКЕТ ========
+function connect(id){
+  if(ws){ ws.onclose = null; ws.close(); }
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws/${id}?token=${encodeURIComponent(token)}`);
+  ws.onopen  = () => { $("status").textContent="онлайн"; $("status").className="on"; };
+  ws.onclose = () => {
+    $("status").textContent="оффлайн"; $("status").className="off";
+    setTimeout(()=>{ if(activeId===id) connect(id); }, 1500);   // авто-реконнект
+  };
+  ws.onmessage = (ev) => {
+    const e = JSON.parse(ev.data);
+    if(e.type === "user_message"){
+      addBubble("user", e.content);
+    } else if(e.type === "assistant_start"){
+      let b = bubbles[e.message_id];
+      if(!b){ b = addBubble("assistant pending",""); bubbles[e.message_id]=b; }
+      else { b.textContent=""; b.classList.add("pending"); }
+    } else if(e.type === "token"){
+      let b = bubbles[e.message_id] || (bubbles[e.message_id]=addBubble("assistant pending",""));
+      b.textContent += e.content; scrollDown();
+    } else if(e.type === "assistant_end"){
+      const b = bubbles[e.message_id];
+      if(b){ b.classList.remove("pending"); if(e.error) b.textContent += "  ⚠️ (обрыв генерации)"; }
+      const it = items.find(x => x.id===activeId);
+      if(it && !it.title) scheduleTitleRefresh();   // подхватить авто-название
+    } else if(e.type === "error"){
+      addBubble("sys", "⚠️ " + e.error);
+    }
+  };
+}
+
+// ======== ОТПРАВКА ========
+function send(){
+  const t = $("text"), text = t.value.trim();
+  if(!text || !ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({text}));       // свой пузырь придёт из эха user_message
+  t.value=""; t.style.height="auto";
+}
+$("send").onclick = send;
+$("text").addEventListener("keydown", (e)=>{ if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); } });
+$("text").addEventListener("input", (e)=>{ e.target.style.height="auto"; e.target.style.height=e.target.scrollHeight+"px"; });
+
+// ======== СТАРТ ========
+(async () => {
+  await loadChatsFirst();
+  if(items.length === 0){ await newChat(); }
+  else { selectChat(items[0].id); }
+})();
+</script>
+</body>
+</html>

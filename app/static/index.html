@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chat — вход</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+         min-height:100vh; display:grid; place-items:center; background:#0f1115; color:#e8eaed; }
+  @media (prefers-color-scheme: light){ body{ background:#f4f5f7; color:#1c1e21; } }
+  .card { width:min(92vw,380px); padding:28px; border-radius:14px;
+          background:#171a21; box-shadow:0 8px 40px rgba(0,0,0,.35); }
+  @media (prefers-color-scheme: light){ .card{ background:#fff; box-shadow:0 8px 40px rgba(0,0,0,.1);} }
+  h1 { margin:0 0 4px; font-size:20px; }
+  p.sub { margin:0 0 20px; font-size:13px; opacity:.65; }
+  .tabs { display:flex; gap:8px; margin-bottom:18px; }
+  .tabs button { flex:1; padding:9px; border:0; border-radius:8px; cursor:pointer;
+                 background:#242832; color:inherit; font-size:14px; }
+  .tabs button.active { background:#3b82f6; color:#fff; }
+  label { display:block; font-size:12px; opacity:.7; margin:12px 0 4px; }
+  input { width:100%; padding:11px; border-radius:8px; border:1px solid #333a47;
+          background:#0f1218; color:inherit; font-size:14px; }
+  @media (prefers-color-scheme: light){ input{ background:#f7f8fa; border-color:#d5d9e0; } }
+  button.primary { width:100%; margin-top:20px; padding:12px; border:0; border-radius:8px;
+          background:#3b82f6; color:#fff; font-size:15px; cursor:pointer; }
+  button.primary:disabled { opacity:.6; cursor:default; }
+  .msg { margin-top:14px; font-size:13px; min-height:18px; }
+  .msg.err { color:#f87171; }
+  .hint { margin-top:16px; font-size:11px; opacity:.5; line-height:1.5; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Chat</h1>
+    <p class="sub">Тестовый доступ. Почта может быть любой (подтверждение не требуется).</p>
+    <div class="tabs">
+      <button id="tab-login" class="active">Вход</button>
+      <button id="tab-register">Регистрация</button>
+    </div>
+    <label>Email</label>
+    <input id="email" type="email" autocomplete="username" placeholder="you@example.com">
+    <label>Пароль</label>
+    <input id="password" type="password" autocomplete="current-password" placeholder="минимум 6 символов">
+    <button id="submit" class="primary">Войти</button>
+    <div id="msg" class="msg"></div>
+    <div class="hint">Пароль хранится только в виде bcrypt-хеша. Один и тот же аккаунт
+      можно открыть с нескольких устройств — диалоги синхронизируются.</div>
+  </div>
+<script>
+let mode = "login";
+const $ = (id) => document.getElementById(id);
+function setMode(m){
+  mode = m;
+  $("tab-login").classList.toggle("active", m==="login");
+  $("tab-register").classList.toggle("active", m==="register");
+  $("submit").textContent = m==="login" ? "Войти" : "Зарегистрироваться";
+  $("password").autocomplete = m==="login" ? "current-password" : "new-password";
+  $("msg").textContent = "";
+}
+$("tab-login").onclick = () => setMode("login");
+$("tab-register").onclick = () => setMode("register");
+
+async function submit(){
+  const email = $("email").value.trim();
+  const password = $("password").value;
+  const msg = $("msg");
+  msg.className = "msg"; msg.textContent = "…";
+  $("submit").disabled = true;
+  try {
+    const res = await fetch("/api/" + mode, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({email, password}),
+    });
+    const data = await res.json();
+    if(!res.ok){ throw new Error(data.detail || "ошибка"); }
+    localStorage.setItem("token", data.token);
+    localStorage.setItem("email", data.email);
+    location.href = "/chat";
+  } catch(e){
+    msg.className = "msg err"; msg.textContent = e.message;
+  } finally {
+    $("submit").disabled = false;
+  }
+}
+$("submit").onclick = submit;
+$("password").addEventListener("keydown", (e)=>{ if(e.key==="Enter") submit(); });
+
+// уже вошли -> сразу в чат
+if(localStorage.getItem("token")) location.href = "/chat";
+</script>
+</body>
+</html>
