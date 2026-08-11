@@ -138,6 +138,19 @@ async def build_prompt(r, conversation_id: str) -> list[dict]:
 
 # ---------- ОБРАБОТКА ОДНОГО ВХОДЯЩЕГО СООБЩЕНИЯ ----------
 
+async def _mark_applied(r, conversation_id: str, applied_value: int) -> None:
+    """Отметить applied и КОГЕРЕНТНО продлить TTL счётчиков порядка (M1).
+
+    Ставим applied и seq одним TTL в один момент -> они истекают вместе. Важно, что seq
+    продлевается воркером НЕ РАНЬШЕ applied (здесь — одновременно), а api при INCR может
+    лишь продлить seq дальше. Значит seq никогда не протухнет раньше applied, и «остывший»
+    диалог не окажется в состоянии applied>seq (что дало бы ложный дроп seq<=applied на
+    первом же новом сообщении). После простоя оба протухают вместе -> счёт с нуля, безопасно."""
+    ttl = settings.conv_counter_ttl_seconds
+    await r.set(keys.conv_applied(conversation_id), applied_value, ex=ttl)
+    await r.expire(keys.conv_seq(conversation_id), ttl)
+
+
 async def _order_gate(r, conversation_id: str, seq: int, fields: dict) -> bool:
     """FIFO-гейт по диалогу. Возвращает True, если сообщение можно применять СЕЙЧАС.
 
@@ -167,7 +180,7 @@ async def _order_gate(r, conversation_id: str, seq: int, fields: dict) -> bool:
             # ждал вычитки, а не потерян) — это потеря хода. Логируем ГРОМКО, чтобы
             # отслеживать в метриках/алертах и при частых срабатываниях поднять
             # order_gap_timeout_ms или разгрузить очередь.
-            await r.set(keys.conv_applied(conversation_id), seq - 1)
+            await _mark_applied(r, conversation_id, seq - 1)   # + продлить TTL (M1)
             print(f"[order][LOSS] conv={conversation_id}: gap timeout after "
                   f"{settings.order_gap_timeout_ms}ms, dropping seq {applied + 1}..{seq - 1}, "
                   f"applying seq={seq}")
@@ -218,6 +231,18 @@ async def process(r, fields: dict):
         # применён другим воркером (reclaim/редоставка длинной генерации). Тогда
         # не повторяем — иначе была бы лишняя генерация (второй вызов LLM).
         if seq and seq <= int(await r.get(keys.conv_applied(conversation_id)) or 0):
+            return
+
+        # ИДЕМПОТЕНТНОСТЬ ВСЕГО ХОДА (M2): если ответ ассистента на этот message_id уже
+        # лежит в Postgres (воркер упал ПОСЛЕ вставки ответа, но ДО отметки applied, и
+        # задачу переобработали через reclaim) — НЕ генерируем заново. Иначе был бы второй
+        # платный вызов LLM и расхождение: клиент увидел бы новый ответ, а в БД остался бы
+        # прежний (вставка идемпотентна по (message_id,'assistant') -> DO NOTHING). Ответ
+        # уже сгенерирован, сохранён и (при первой попытке) отстримлен — просто
+        # досдвигаем applied и выходим.
+        if message_id and await db.assistant_exists(conversation_id, message_id):
+            if seq:
+                await _mark_applied(r, conversation_id, seq)
             return
 
         # 1) ПЕРЕНОС hot<-: сообщение юзера. БД идемпотентна (ON CONFLICT по
@@ -276,8 +301,11 @@ async def process(r, fields: dict):
                              {"role": "assistant", "content": answer, "mid": message_id})
         if inserted:
             n = await r.incrby(keys.since_sum_key(conversation_id), 2)
+            await r.expire(keys.since_sum_key(conversation_id),   # TTL счётчика (M1)
+                           settings.conv_counter_ttl_seconds)
             if n >= settings.summary_trigger_messages:
-                await r.set(keys.since_sum_key(conversation_id), 0)
+                await r.set(keys.since_sum_key(conversation_id), 0,
+                            ex=settings.conv_counter_ttl_seconds)
                 await r.xadd(settings.summarize_stream,
                              {"conversation_id": conversation_id},
                              maxlen=settings.summarize_stream_maxlen, approximate=True)
@@ -291,8 +319,9 @@ async def process(r, fields: dict):
                              maxlen=settings.summarize_stream_maxlen, approximate=True)
 
         # Порядок: помечаем seq применённым СТРОГО после успеха (до снятия замка).
+        # _mark_applied заодно когерентно продлевает TTL счётчиков порядка (M1).
         if seq:
-            await r.set(keys.conv_applied(conversation_id), seq)
+            await _mark_applied(r, conversation_id, seq)
     finally:
         hb.cancel()
         # Снимаем ТОЛЬКО свой замок (owner-aware). Безусловный DEL мог бы снести замок,

@@ -15,7 +15,14 @@ _pool: asyncpg.Pool | None = None
 async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
-        _pool = await asyncpg.create_pool(settings.postgres_dsn, min_size=1, max_size=10)
+        # Таймауты (M3): command_timeout — клиентская отмена каждого запроса; statement_timeout
+        # (server_settings) — серверный предел, отменяет запрос на стороне БД. Без них
+        # зависший запрос держал бы соединение из пула бесконечно -> исчерпание пула.
+        _pool = await asyncpg.create_pool(
+            settings.postgres_dsn, min_size=1, max_size=10,
+            command_timeout=settings.pg_command_timeout,
+            server_settings={"statement_timeout": str(settings.pg_statement_timeout_ms)},
+        )
     return _pool
 
 
@@ -167,6 +174,23 @@ async def insert_message(conversation_id: str, role: str, content: str,
             _uid(conversation_id), role, content, message_id,
         )
     return row is not None
+
+
+async def assistant_exists(conversation_id: str, message_id: str) -> bool:
+    """Есть ли уже ответ ассистента на этот входящий message_id (M2).
+
+    Идемпотентность ВСЕГО хода: если ответ уже в БД (воркер упал после его вставки, но
+    до отметки applied, и задачу переобработали), генерировать заново НЕЛЬЗЯ — иначе
+    второй платный вызов LLM и расхождение «клиент видел ответ №2, а в БД №1». Опирается
+    на тот же частичный уникальный индекс (message_id, role), что и дедуп вставки."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        val = await conn.fetchval(
+            """SELECT 1 FROM messages
+               WHERE conversation_id = $1 AND message_id = $2 AND role = 'assistant'
+               LIMIT 1""",
+            _uid(conversation_id), message_id)
+    return val is not None
 
 
 async def load_recent_messages(conversation_id: str, limit: int) -> list[dict]:

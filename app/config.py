@@ -8,6 +8,14 @@ class Settings(BaseSettings):
     # инфраструктура
     redis_url: str = "redis://localhost:6379/0"
     postgres_dsn: str = "postgresql://app:app@localhost:5432/chat"
+    # Таймауты Postgres (M3): без них зависший/медленный запрос держит соединение из пула
+    # бесконечно; несколько таких — и пул (max_size=10) исчерпан, процесс встал.
+    # command_timeout — клиентская отмена запроса (сек); statement_timeout — серверный
+    # предел на запрос (мс), отменяет его на стороне БД. Пул общий для api/воркеров;
+    # раннер миграций идёт по ОТДЕЛЬНОМУ соединению (migrate.py) и под этот лимит не
+    # попадает (длинный DDL не оборвётся). Держите оба > самого долгого штатного запроса.
+    pg_command_timeout: float = 30.0
+    pg_statement_timeout_ms: int = 30000
 
     # внешний LLM API (OpenAI-совместимый по формату; подставь свой)
     llm_api_url: str = "https://api.openai.com/v1/chat/completions"
@@ -22,6 +30,16 @@ class Settings(BaseSettings):
     # доходит до summary_recent_keep + summary_trigger_messages, поэтому окно должно
     # быть НЕ МЕНЬШЕ этой суммы (см. валидатор ниже). 40 = 20 keep + 20 trigger.
     ctx_max_messages: int = 40       # >= summary_recent_keep + summary_trigger_messages
+
+    # TTL счётчиков порядка диалога seq/applied/since_sum (M1). Без него эти ключи копятся
+    # вечно — по одному триплету на КАЖДЫЙ диалог за всю жизнь сервиса -> медленный рост
+    # памяти Redis без эвикции. Обновляются на активности диалога; после простоя протухают
+    # ВМЕСТЕ (воркер продлевает seq не раньше applied — см. _mark_applied), поэтому
+    # «остывший» диалог просто начнёт счёт заново с нуля — это БЕЗОПАСНО: seq/applied —
+    # чисто redis-токены порядка, не связаны с id сообщений в Postgres. Держите заметно
+    # больше времени обработки/бэклога и order_gap_timeout_ms (иначе счётчики протухнут
+    # под живым, но медленным диалогом).
+    conv_counter_ttl_seconds: int = 86400   # 1 сутки
 
     # resumable streams: сколько живёт лента токенов генерации (gen:{id}:{mid})
     # после завершения. В этом окне реконнект переиграет даже готовый ответ.
@@ -105,8 +123,11 @@ class Settings(BaseSettings):
     # Реклейм зависших задач: заберём у «мёртвого» воркера всё, что висит в PEL
     # дольше этого простоя (мс). ВАЖНО: держите заметно больше максимального времени
     # генерации ответа, иначе долгий (напр. на большом контексте) ответ,
-    # ещё висящий в PEL, будет ошибочно реклеймлен и сгенерирован повторно.
-    reclaim_min_idle_ms: int = 120000
+    # ещё висящий в PEL, будет ошибочно реклеймлен, и второй воркер зря прокрутится на
+    # замке всю генерацию (M2). Валидатор ниже требует reclaim_min_idle_ms >=
+    # conv_lock_ttl_seconds*1000: не забирать задачу раньше, чем истёк бы замок мёртвого
+    # воркера. Дефолт поднят до 300000 (=TTL замка), было 120000.
+    reclaim_min_idle_ms: int = 300000
     # Как часто (раз в N итераций основного цикла) запускать реклейм PEL.
     reclaim_every_iters: int = 20
 
@@ -175,6 +196,28 @@ class Settings(BaseSettings):
         ceiling = max(ceiling, 512)   # деградация, но не абсурд
         if self.prompt_token_budget <= 0 or self.prompt_token_budget > ceiling:
             self.prompt_token_budget = ceiling
+        return self
+
+    @model_validator(mode="after")
+    def _check_lock_and_reclaim_timing(self):
+        """Согласованность таймингов замка диалога и реклейма (M2). Фейл-фаст на
+        конфиге, который тихо ломает сериализацию обработки:
+
+        - heartbeat ОБЯЗАН продлевать замок раньше истечения его TTL, иначе замок умрёт
+          между продлениями и два воркера возьмут один диалог;
+        - реклейм не должен забирать задачу раньше, чем истёк бы замок мёртвого воркера
+          (reclaim_min_idle_ms >= conv_lock_ttl_seconds*1000). Иначе задачу ЖИВОГО, но
+          долго генерящего воркера реклеймят на лету, и второй воркер впустую крутится
+          на замке всю генерацию (лишней генерации нет — её ловит перепроверка applied —
+          но пропускная способность падает)."""
+        if self.lock_heartbeat_seconds >= self.conv_lock_ttl_seconds:
+            raise ValueError(
+                "lock_heartbeat_seconds must be < conv_lock_ttl_seconds "
+                "(heartbeat must renew the lock before its TTL expires)")
+        if self.reclaim_min_idle_ms < self.conv_lock_ttl_seconds * 1000:
+            raise ValueError(
+                "reclaim_min_idle_ms must be >= conv_lock_ttl_seconds*1000 "
+                "(don't reclaim a task before a dead worker's lock would expire)")
         return self
 
     @model_validator(mode="after")

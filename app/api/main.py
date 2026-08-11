@@ -343,7 +343,11 @@ async def ws_endpoint(ws: WebSocket, conversation_id: str):
                 continue
 
             # seq — монотонный номер сообщения в диалоге (FIFO-порядок в воркере).
+            # Продлеваем TTL счётчика на активности (M1): в паре с продлением в воркере
+            # (_mark_applied) это держит seq живым не меньше applied, а после простоя оба
+            # протухают вместе -> счёт с нуля, без ложных дропов.
             seq = await r.incr(keys.conv_seq(conversation_id))
+            await r.expire(keys.conv_seq(conversation_id), settings.conv_counter_ttl_seconds)
 
             # XADD кладёт задачу в durable-очередь и мгновенно возвращает управление.
             # Пользователь может слать новые сообщения, не дожидаясь ответа LLM.
