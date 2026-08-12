@@ -187,6 +187,13 @@ PEL/`XAUTOCLAIM` работали некорректно.
   был Pub/Sub с переподпиской — переведён на durable Stream `events:{id}`, см. [02](02-websocket-api.md), [07](07-resumable-streams.md).)*
 - **Фейл-фаст секрета.** Валидатор конфига не даёт подняться с дефолтным `auth_secret` при
   `auth_dev_mode=false`. Проверено.
+- **Фейл-фаст пароля БД (M3-review).** `_guard_postgres_password` не даёт подняться в не-dev
+  режиме с дефолтным/слабым паролем в `POSTGRES_DSN` (`app`/`postgres`/…): source-of-truth БД
+  с хешами паролей не запускается на общеизвестной учётке даже во внутренней сети compose.
+  Гейтится `auth_dev_mode` (для локали `app/app` остаётся рабочим). Проверено.
+- **Перезапись X-Forwarded-For на краю (H3-review).** Caddy ставит `header_up X-Forwarded-For
+  {remote_host}` — заменяет присланный клиентом заголовок реальным IP пира, иначе per-IP
+  рейтлимит `register`/`login` (#3) обходился бы подделкой заголовка (брутфорс + bcrypt-DoS).
 - **Non-root контейнер.** Dockerfile создаёт `appuser`; api за прокси — `--proxy-headers`.
 
 ## R2. Прод-ревью, проход 2 (2026-08-12): критичные и high-фиксы

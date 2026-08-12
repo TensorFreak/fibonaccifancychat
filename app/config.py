@@ -1,6 +1,7 @@
 """Централизованная конфигурация. Читается из переменных окружения / .env.
 Один и тот же объект settings импортируют И api, И воркеры — это общий код."""
 from typing import ClassVar
+from urllib.parse import unquote, urlsplit
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
@@ -383,6 +384,35 @@ class Settings(BaseSettings):
                 "AUTH_SECRET must be a long random value (>=32 chars) when "
                 "AUTH_DEV_MODE=false. Generate one with: "
                 "python -c \"import secrets; print(secrets.token_urlsafe(48))\"")
+        return self
+
+    @model_validator(mode="after")
+    def _guard_postgres_password(self):
+        """Фейл-фаст против запуска source-of-truth БД на ДЕФОЛТНОМ пароле (M3-review).
+
+        Postgres хранит всё ценное: строки пользователей, ХЕШИ ПАРОЛЕЙ, всю историю
+        диалогов. Порт наружу не публикуется (C1), но дефолтный пароль — это отсутствие
+        второго рубежа: любой, кто попал во внутреннюю сеть compose (соседний контейнер,
+        SSRF, ошибка сети), получает БД под общеизвестной учёткой `app/app`. Как и у
+        `_guard_auth_secret`: не даём подняться в НЕ-dev режиме, пока пароль не сменён.
+
+        Гейтим по `auth_dev_mode` — для локального теста `app/app` остаётся рабочим
+        дефолтом. Пароль достаём из DSN (его читает приложение); нераспарсиваемый DSN
+        пропускаем (нестандартная строка — оператор знает, что делает)."""
+        if self.auth_dev_mode:
+            return self
+        try:
+            password = unquote(urlsplit(self.postgres_dsn).password or "")
+        except Exception:
+            return self
+        weak = {"", "app", "postgres", "password", "changeme", "change-me"}
+        if password in weak:
+            raise ValueError(
+                "POSTGRES_DSN uses a default/weak database password while "
+                "AUTH_DEV_MODE=false. Postgres is the source of truth (password "
+                "hashes, all conversation history) — a default password leaves it with "
+                "no second line of defense inside the compose network. Set a strong "
+                "password in POSTGRES_DSN (and keep POSTGRES_PASSWORD in sync).")
         return self
 
     class Config:

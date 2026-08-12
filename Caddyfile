@@ -18,5 +18,14 @@
 		Referrer-Policy "no-referrer"
 		-Server
 	}
-	reverse_proxy api:8000
+	# X-Forwarded-For ПЕРЕЗАПИСЫВАЕМ реальным адресом TCP-пира ({remote_host}), а НЕ
+	# добавляем к присланному клиентом (H3). Caddy здесь — интернет-край, поэтому
+	# {remote_host} = настоящий клиент. Без этого клиент мог прислать свой X-Forwarded-For,
+	# Caddy дописал бы к нему реальный IP, а uvicorn (доверяющий заголовку от caddy) взял бы
+	# КЛИЕНТОМ управляемый элемент списка — и per-IP рейтлимит register/login (#3) обходился бы
+	# сменой заголовка (брутфорс пароля + CPU-DoS через bcrypt). Перезапись закрывает это
+	# независимо от того, какой конец X-Forwarded-For выбирает конкретная версия uvicorn.
+	reverse_proxy api:8000 {
+		header_up X-Forwarded-For {remote_host}
+	}
 }
