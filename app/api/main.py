@@ -8,7 +8,9 @@
 Задача этого слоя:
   1) АВТОРИЗАЦИЯ: проверить токен и владение диалогом (иначе доступ к чужим данным);
   2) ВХОД:  принять текст из сокета -> XADD в Redis Stream (отдать работу воркеру);
-  3) ВЫХОД: control-события из Pub/Sub + токены ответа из durable-ленты -> в сокет.
+  3) ВЫХОД: control-события из durable-ленты events:{id} + токены ответа из durable-ленты
+     gen:{id}:{mid} -> в сокет. Pub/Sub не используется: обе ленты переживают обрыв и
+     переигрываются на реконнекте (resumable).
 
 FastAPI НЕ ходит к LLM и НЕ пишет историю в Postgres. Единственное обращение к БД —
 проверка владения диалогом при подключении (источник истины по доступу).
@@ -172,10 +174,25 @@ async def conversation_history(conversation_id: str,
     if not await db.user_owns_conversation(user_id, conversation_id):
         raise HTTPException(status_code=403, detail="forbidden")
     n = _clamp_limit(limit, settings.messages_page_size)
+
+    # СНАПШОТ-КОНСИСТЕНТНЫЙ ДОГОН СОБЫТИЙ (только для первой страницы, before=None):
+    # курсор ленты events:{id} читаем СТРОГО ДО выборки сообщений. Тогда любое событие
+    # ПОСЛЕ курсора клиент дотейлит по вебсокету (?last_event_id=events_cursor), а любое
+    # событие ДО/НА курсоре уже отражено в этой истории — воркер пишет сообщение в Postgres
+    # ДО XADD события, поэтому событие в ленте => строка уже была в БД к моменту чтения
+    # курсора => попала в снапшот. Порядок «cursor-first» закрывает дыру между снапшотом и
+    # подпиской, которую с Pub/Sub закрыть было нельзя. Пустая лента -> "0" (тейл с начала).
+    events_cursor = None
+    if before is None:
+        r = get_redis()
+        last = await r.xrevrange(keys.events_stream(conversation_id), count=1)
+        events_cursor = last[0][0] if last else "0"
+
     messages, has_more = await db.load_messages_page(conversation_id, n, before)
     # next_cursor = id самого старого сообщения страницы (грузить строго старше него)
     next_cursor = messages[0]["id"] if has_more and messages else None
-    return {"messages": messages, "next_cursor": next_cursor, "has_more": has_more}
+    return {"messages": messages, "next_cursor": next_cursor,
+            "has_more": has_more, "events_cursor": events_cursor}
 
 
 # ---------- Веб-страницы ----------
@@ -280,6 +297,13 @@ async def ws_endpoint(ws: WebSocket, conversation_id: str):
         await ws.close(code=1008)          # диалог принадлежит другому пользователю
         return
 
+    # Курсор догона control-событий. Клиент передаёт last_event_id — id последнего
+    # ПРИМЕНЁННОГО события ленты events:{id}: при первом коннекте это events_cursor из
+    # снапшота истории (догон строго после снапшота, без дыр/дублей), при реконнекте —
+    # последнее виденное событие (переиграем ровно пропущенное за время обрыва).
+    # Пусто -> "$": только новые события с этого момента.
+    last_event_id = ws.query_params.get("last_event_id") or "$"
+
     tasks: set[asyncio.Task] = set()
     tailing: set[str] = set()             # message_id генераций, уже тейлящихся
 
@@ -297,40 +321,44 @@ async def ws_endpoint(ws: WebSocket, conversation_id: str):
         tasks.add(t)
         t.add_done_callback(tasks.discard)
 
-    # --- Control-канал: conv:{id} (Pub/Sub) несёт события управления:
-    #     эхо user_message и сигнал gen_start. Токены ассистента — durable-лентой. ---
-    pubsub = r.pubsub()
+    # --- Control-канал: durable-лента events:{id} (Redis Stream) ВМЕСТО Pub/Sub.
+    #     Несёт эхо user_message и сигнал gen_start. Токены ассистента — отдельной
+    #     durable-лентой gen:{id}:{mid}. Читаем тем же XREAD BLOCK, что и токены. ---
+    async def pump_out(last_id: str):
+        """Тейлит ленту событий. Durable => переживает обрыв Redis/сети: на реконнекте
+        продолжаем с last_id и переигрываем пропущенное. Каждое событие несём клиенту с
+        полем eid (id записи) — по нему клиент двигает свой курсор догона (last_event_id).
 
-    async def pump_out():
-        """Устойчив к рестарту/обрыву Redis: при ошибке переподписывается. После
-        (пере)подписки ДЕЛАЕМ ДОГОН по active_gen — так ловим и генерацию, идущую с
-        момента коннекта, и ту, что стартовала в окно, пока Pub/Sub был отвалившимся
-        (пропущенный gen_start компенсируется этой проверкой)."""
+        ДОГОН АКТИВНОЙ ГЕНЕРАЦИИ: gen_start, случившийся ДО last_id (генерация уже шла на
+        момент коннекта — например, началась между снапшотом истории и подпиской, либо шла
+        ещё до открытия чата), в ленте не переиграется. Его ловит active_gen (ставится ДО
+        gen_start, снимается по завершении): проверяем при старте и после каждого
+        переподключения. tail_generation идемпотентен по message_id — двойного тейла нет."""
+        ev_key = keys.events_stream(conversation_id)
         while True:
             try:
-                await pubsub.subscribe(keys.conv_channel(conversation_id))
                 active_mid = await r.get(keys.active_gen(conversation_id))
                 if active_mid:
                     start_tail(active_mid)
-                async for msg in pubsub.listen():
-                    if msg["type"] != "message":
-                        continue
-                    evt = json.loads(msg["data"])
-                    if evt.get("type") == "gen_start":
-                        start_tail(evt["message_id"])   # токены — из durable-ленты
-                    else:
-                        await send(msg["data"])         # user_message и прочий control
+                while True:
+                    resp = await r.xread({ev_key: last_id}, block=5000, count=100)
+                    if not resp:
+                        continue                        # таймаут XREAD -> ждём дальше
+                    for _key, entries in resp:
+                        for entry_id, fields in entries:
+                            last_id = entry_id
+                            evt = json.loads(fields["data"])
+                            evt["eid"] = entry_id       # курсор догона для клиента
+                            if evt.get("type") == "gen_start":
+                                start_tail(evt["message_id"])   # токены — из gen:{}-ленты
+                            await send(json.dumps(evt))  # gen_start клиент шлёт лишь для eid
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.warning("pubsub reconnect conv=%s: %r", conversation_id, e)
-                try:
-                    await pubsub.unsubscribe(keys.conv_channel(conversation_id))
-                except Exception:
-                    pass
-                await asyncio.sleep(1.0)                # пауза перед переподпиской
+                log.warning("events tail reconnect conv=%s: %r", conversation_id, e)
+                await asyncio.sleep(1.0)                # пауза перед повторным XREAD
 
-    out_task = asyncio.create_task(pump_out())
+    out_task = asyncio.create_task(pump_out(last_event_id))
 
     try:
         # --- ВХОДНОЙ цикл: сокет -> Redis Stream ---
@@ -395,8 +423,6 @@ async def ws_endpoint(ws: WebSocket, conversation_id: str):
         out_task.cancel()
         for t in tasks:
             t.cancel()
-        await pubsub.unsubscribe(keys.conv_channel(conversation_id))
-        await pubsub.aclose()
 
 
 @app.get("/healthz")

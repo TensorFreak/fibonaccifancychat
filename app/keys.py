@@ -8,9 +8,13 @@ def ctx_key(conversation_id: str) -> str:
     return f"ctx:{conversation_id}"
 
 
-def conv_channel(conversation_id: str) -> str:
-    # Redis Pub/Sub канал: сюда воркер публикует токены, отсюда api их шлёт в сокеты
-    return f"conv:{conversation_id}"
+def events_stream(conversation_id: str) -> str:
+    # Redis STREAM: durable-лента control-событий диалога (gen_start, эхо user_message).
+    # Заменяет эфемерный Pub/Sub conv:{id}: события переживают обрыв и переигрываются —
+    # (пере)подключившийся клиент догоняет пропущенное по своему last_event_id. MAXLEN+TTL
+    # держат ленту ограниченной; после TTL догон невозможен -> клиент восстановит состояние
+    # перезагрузкой истории из Postgres (та же граница, что у gen:{}).
+    return f"events:{conversation_id}"
 
 
 def conv_lock(conversation_id: str) -> str:

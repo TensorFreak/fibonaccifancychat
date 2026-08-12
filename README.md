@@ -44,19 +44,20 @@ FastAPI** (балансировщик выбирает инстанс). Два �
 | **Redis Stream** `chat:inbound` | входящие задачи `{conversation_id, user_id, message_id, text}` | до XACK | durable-очередь, развязка api↔worker |
 | **Redis Stream** `chat:summarize` | задачи суммаризации `{conversation_id}` | до XACK | очередь для исполнителя №3 |
 | **Redis STRING** `sum:{id}` | кэш текущего summary | TTL 30 мин | быстрый доступ к резюме для промпта |
-| **Redis Pub/Sub** `conv:{id}` | события генерации (`token`, `assistant_start/end`, `user_message`) | не хранится (fire-and-forget) | доставка потока во все устройства диалога |
+| **Redis Stream** `gen:{id}:{mid}` | токены одной генерации ответа | TTL 5 мин после `end` | resumable-лента ответа (реплей на реконнекте) |
+| **Redis Stream** `events:{id}` | control-события (`gen_start`, `user_message`) | TTL 15 мин | resumable-лента событий во все устройства диалога |
 | **Redis LIST** `ctx:{id}` | горячее окно последних N сообщений | TTL 30 мин | быстрый контекст для сборки промпта |
-| **Redis key** `lock:conv:{id}` | замок диалога | TTL 120 c | сериализация сообщений одного диалога |
+| **Redis key** `lock:conv:{id}` | замок диалога | TTL 300 c + heartbeat | сериализация сообщений одного диалога |
 | **Postgres** | вся история (`messages`), пользователи, диалоги | вечно | source of truth |
 
 ## Кто что делает (исполнители)
 
 - **FastAPI (`api`)** — синхронный горячий путь. Принял текст из сокета → `XADD` в стрим.
-  Подписан на `conv:{id}` → всё, что публикует воркер, шлёт в сокет. К модели НЕ ходит,
-  в Postgres НЕ пишет.
+  Тейлит durable-ленты `events:{id}` (control) и `gen:{id}:{mid}` (токены) через `XREAD` →
+  шлёт в сокет. К модели НЕ ходит, в Postgres НЕ пишет.
 - **LLM-воркер (`worker`)** — фоновый процесс, `python -m app.workers.llm_worker`.
   **Переносит данные** (Redis↔Postgres), **ходит к модели** и **возвращает ответ**
-  (публикует токены в Pub/Sub). Масштабируется как N копий в одной consumer group.
+  (пишет токены в durable-ленту `gen:{id}:{mid}`). Масштабируется как N копий в одной consumer group.
   В конце каждого ответа копит счётчик и, набрав порог, ставит задачу в `chat:summarize`.
 - **Суммаризатор (`summarizer`)** — фоновый процесс, `python -m app.workers.summarizer`.
   Разбирает `chat:summarize`, сворачивает старую часть диалога в `summary` (Postgres +
@@ -84,11 +85,11 @@ FastAPI** (балансировщик выбирает инстанс). Два �
                     persist(user)->PG | append ctx->Redis
                     load ctx (Redis / miss->PG)
                     stream_completion(context)  --> внешний LLM API
-                    на каждый токен: PUBLISH conv:{id}
+                    на каждый токен: XADD gen:{id}:{mid}   (durable-лента)
                                           |
-   FastAPI(A) и FastAPI(B) подписаны на conv:{id}  <-- Pub/Sub fan-out
+   FastAPI(A) и FastAPI(B): XREAD gen:{id}:{mid} + events:{id}  <-- durable fan-out
         |                         |
-   устройство 1              устройство 2   (оба видят стрим)
+   устройство 1              устройство 2   (оба видят стрим, реплей на реконнекте)
                     в конце: persist(assistant)->PG | append ctx->Redis
 ```
 

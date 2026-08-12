@@ -15,9 +15,11 @@
 
 | Канал | Что несёт | Свойство |
 |---|---|---|
-| Pub/Sub `conv:{id}` | control: `gen_start`, `user_message` | эфемерный |
+| Stream `events:{id}` | control: `gen_start`, `user_message` | durable, реплеится, TTL (догон по `last_event_id`) |
 | Stream `gen:{id}:{mid}` | токены ответа ассистента | durable, реплеится, TTL |
 | String `active_gen:{id}` | id идущей сейчас генерации | догон на коннекте |
+
+Обе ленты — Redis Stream, читаются одним и тем же `XREAD BLOCK`; Pub/Sub не используется. Ниже разобрана лента токенов; лента событий устроена так же (см. [02](02-websocket-api.md)).
 
 ## Сторона воркера (продюсер)
 
@@ -26,7 +28,7 @@ gen_message_id = str(uuid.uuid4())                       # отдельный id
 gen_key = keys.gen_stream(conversation_id, gen_message_id)
 
 await r.set(keys.active_gen(conversation_id), gen_message_id, ex=settings.gen_ttl_seconds)
-await r.publish(channel, json.dumps({"type": "gen_start", "message_id": gen_message_id}))
+await _emit_event(r, conversation_id, {"type": "gen_start", "message_id": gen_message_id})  # events:{id}
 
 parts = []
 async for token in stream_completion(prompt):
@@ -44,7 +46,7 @@ await r.delete(keys.active_gen(conversation_id))
 ```
 
 - `active_gen:{id}` — маркер «идёт генерация X». По нему подключающийся клиент узнаёт, какую ленту догонять; он же служит признаком «генерация ещё активна» для тейла (см. ниже). Свой TTL — чтобы не завис, если воркер умрёт.
-- `gen_start` в Pub/Sub — сигнал уже подключённым сокетам начать тейл. Если сигнал потеряется (Pub/Sub), клиент восстановит `message_id` из `active_gen` при подключении — дублирующая гарантия.
+- `gen_start` в durable-ленте `events:{id}` — сигнал сокетам начать тейл; durable, поэтому переживает обрыв и переигрывается по `last_event_id`. Для генерации, начавшейся **до** курсора клиента (уже шла на момент коннекта), сигнал в ленте не переиграется — тогда клиент восстановит `message_id` из `active_gen` при подключении (дублирующая гарантия).
 - Каждый токен → запись `{"t":"token","c":...}`. Финал → запись `{"t":"end"}` (с `error=1`, если ответ модели пустой — [10](10-hardening.md), R5-2).
 - Во время генерации у ленты active-TTL `gen_active_ttl_seconds` (900 c), после завершения — `gen_ttl_seconds` (300 c): в этом окне реконнект переиграет **даже полностью готовый** ответ. Затем `EXPIRE` её убирает.
 
@@ -108,7 +110,7 @@ async def tail_generation(ws, r, conversation_id, message_id, tailing, send):
    if active_mid:
        start_tail(active_mid)
    ```
-2. **Генерация началась при подключённом сокете** — по `gen_start` из Pub/Sub:
+2. **Генерация началась при подключённом сокете** — по `gen_start` из ленты `events:{id}`:
    ```python
    if evt.get("type") == "gen_start":
        start_tail(evt["message_id"])
@@ -135,7 +137,7 @@ async def tail_generation(ws, r, conversation_id, message_id, tailing, send):
 
 ## Границы
 
-- **`user_message`-эхо не resumable** — идёт эфемерным Pub/Sub. При обрыве реплика пользователя с другого устройства может не отобразиться до перезагрузки истории. Чтобы сделать resumable и её, нужна durable-лента событий диалога (`events:{id}`) — намеренно не сделано в скелете.
+- **`user_message`-эхо resumable** — идёт durable-лентой `events:{id}` наравне с токенами. При обрыве реплика пользователя с другого устройства переигрывается по `last_event_id` клиента; за пределами TTL ленты (`events_ttl_seconds`) — восстанавливается перезагрузкой истории из Postgres (та же граница, что у `gen:{}`). Клиент применяет эхо идемпотентно по `message_id`.
 - **Ошибка LLM посреди генерации** — лента **всегда** завершается: воркер пишет
   `{"t":"end","error":"1"}`, ставит TTL, снимает `active_gen` и пробрасывает ошибку
   (уйдёт в ретрай). Клиент получает `assistant_end` с `error="1"`. Лента не утекает.

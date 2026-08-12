@@ -84,7 +84,7 @@ Async через `asyncpg`, пул соединений (`min_size=1, max_size=1
 | `ctx:{id}` | List | горячее окно последних сообщений | 1800 c | [05](05-hot-context.md) |
 | `sum:{id}` | String | кэш текущего резюме | 1800 c | [06](06-summarization.md) |
 | `since_sum:{id}` | String (счётчик) | сколько сообщений с последней свёртки | 86400 c | [06](06-summarization.md) |
-| `conv:{id}` | Pub/Sub | control-события (`gen_start`, `user_message`) | не хранится | [02](02-websocket-api.md) |
+| `events:{id}` | Stream | control-события (`gen_start`, `user_message`) | 900 c | [02](02-websocket-api.md) |
 | `gen:{id}:{mid}` | Stream | токены одной генерации | 300 c после `end` (900 c во время) | [07](07-resumable-streams.md) |
 | `active_gen:{id}` | String | id идущей сейчас генерации | 300 c | [07](07-resumable-streams.md) |
 | `lock:conv:{id}` | String | замок диалога (сериализация) | 300 c + heartbeat | [04](04-llm-worker.md) |
@@ -100,7 +100,7 @@ TTL счётчиков `since_sum`/`seq:conv`/`applied:conv` (`conv_counter_ttl_
 Redis-ключом, а частичным уникальным индексом `(message_id, role)` в Postgres — см.
 [10](10-hardening.md), C3.
 
-Функции-конструкторы ключей в `keys.py`: `ctx_key`, `conv_channel`, `conv_lock`, `sum_key`,
+Функции-конструкторы ключей в `keys.py`: `ctx_key`, `events_stream`, `conv_lock`, `sum_key`,
 `since_sum_key`, `gen_stream`, `active_gen`, `title_enq`, `conv_seq`, `ws_rate`, `conv_applied`.
 Замок суммаризации (`lock:sum:{id}`) и dead-letter-стримы (`<stream>:dead`) собираются по месту.
 Стримы/группы — в `config.py`.

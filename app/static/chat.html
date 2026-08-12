@@ -104,6 +104,8 @@ let oldestCursor = null, loadingOlder = false;      // message_cursor (прок�
 let chatCursor = null, chatHasMore = false, loadingChats = false;  // chat_cursor
 let items = [];                                     // [{id, title, created_at}]
 const bubbles = {};                                 // message_id -> элемент бабла
+let lastEventId = "$";                              // курсор ленты событий (догон на реконнекте)
+let seenUser = new Set();                           // message_id эх user_message (идемпотентность)
 
 function authHeaders(){ return {"Authorization":"Bearer "+token, "Content-Type":"application/json"}; }
 async function api(path, opts={}){
@@ -185,13 +187,13 @@ async function newChat(){
 $("newBtn").onclick = newChat;
 $("burger").onclick = () => $("sidebar").classList.toggle("open");
 
-function selectChat(id){
+async function selectChat(id){
   activeId = id;
   const it = items.find(x => x.id===id);
   $("title").textContent = (it && it.title) || "Новый чат";
   renderSidebar();
-  loadHistory(id);
-  connect(id);
+  await loadHistory(id);   // сначала история -> получаем events_cursor (снапшот)
+  if(activeId === id) connect(id);   // затем тейл событий СТРОГО после снапшота
 }
 
 // ======== СООБЩЕНИЯ ========
@@ -207,10 +209,14 @@ async function loadHistory(id){
   $("log").innerHTML = "";
   for(const k in bubbles) delete bubbles[k];
   oldestCursor = null; loadingOlder = false;
+  lastEventId = "$"; seenUser = new Set();   // сброс курсора догона под новый чат
   try{
     const res = await api("/api/conversations/"+id+"/messages");
     for(const m of res.messages){ addBubble(m.role==="user"?"user":"assistant", m.content); }
     oldestCursor = res.next_cursor;
+    // events_cursor — конец ленты событий на момент этого снапшота истории. Тейлим строго
+    // после него: события до/на нём уже в загруженной истории, после — дотейлим по ws.
+    if(res.events_cursor) lastEventId = res.events_cursor;
   }catch(e){ /* новый чат без истории */ }
 }
 async function loadOlder(){
@@ -236,7 +242,11 @@ $("log").addEventListener("scroll", ()=>{ if($("log").scrollTop < 40) loadOlder(
 function connect(id){
   if(ws){ ws.onclose = null; ws.close(); }
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${proto}://${location.host}/ws/${id}?token=${encodeURIComponent(token)}`);
+  // last_event_id: догон событий строго после последнего применённого (снапшот истории
+  // при первом коннекте, последнее виденное событие — при авто-реконнекте).
+  const q = "token=" + encodeURIComponent(token) +
+            (lastEventId ? "&last_event_id=" + encodeURIComponent(lastEventId) : "");
+  ws = new WebSocket(`${proto}://${location.host}/ws/${id}?${q}`);
   ws.onopen  = () => { $("status").textContent="онлайн"; $("status").className="on"; };
   ws.onclose = () => {
     $("status").textContent="оффлайн"; $("status").className="off";
@@ -244,8 +254,13 @@ function connect(id){
   };
   ws.onmessage = (ev) => {
     const e = JSON.parse(ev.data);
+    if(e.eid) lastEventId = e.eid;   // событие ленты -> двигаем курсор догона
     if(e.type === "user_message"){
+      // Идемпотентно по message_id: на реконнекте эхо могло переиграться -> без дублей.
+      if(e.message_id){ if(seenUser.has(e.message_id)) return; seenUser.add(e.message_id); }
       addBubble("user", e.content);
+    } else if(e.type === "gen_start"){
+      // Токены придут отдельным assistant_start/token из gen-ленты; здесь только курсор.
     } else if(e.type === "assistant_start"){
       let b = bubbles[e.message_id];
       if(!b){ b = addBubble("assistant pending",""); bubbles[e.message_id]=b; }

@@ -43,6 +43,3 @@ class FakeRedis:
     async def xack(self, stream, group, msg_id):
         self.acked.append(msg_id)
         return 1
-
-    async def publish(self, channel, data):
-        return 0

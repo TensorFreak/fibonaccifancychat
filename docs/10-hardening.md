@@ -181,8 +181,10 @@ PEL/`XAUTOCLAIM` работали некорректно.
 - **bcrypt в threadpool.** `hash_password`/`verify_password` теперь `async` через
   `asyncio.to_thread` — не блокируют event loop api; пароль обрезается до 72 байт (не
   крашится) и ограничен `password_max_chars`.
-- **Resubscribe Pub/Sub.** `pump_out` переживает рестарт Redis: переподписывается и делает
-  повторный догон `active_gen` (компенсирует пропущенный `gen_start`).
+- **Resume events tail.** `pump_out` переживает рестарт/обрыв Redis: повторяет `XREAD` ленты
+  `events:{id}` с того же `last_id` (события durable — ничего не теряется) и делает повторный
+  догон `active_gen` (ловит генерацию, начавшуюся до курсора клиента). *(Ранее control-канал
+  был Pub/Sub с переподпиской — переведён на durable Stream `events:{id}`, см. [02](02-websocket-api.md), [07](07-resumable-streams.md).)*
 - **Фейл-фаст секрета.** Валидатор конфига не даёт подняться с дефолтным `auth_secret` при
   `auth_dev_mode=false`. Проверено.
 - **Non-root контейнер.** Dockerfile создаёт `appuser`; api за прокси — `--proxy-headers`.
@@ -333,7 +335,7 @@ fail-open дефолт auth, некорректное снятие распре�
 
 ### R4-H1 (HIGH). Стриминг молча умирал при TTFT > 5 c
 
-**Было:** воркер ставит `active_gen`, публикует `gen_start`, и только ПОТОМ идёт к модели —
+**Было:** воркер ставит `active_gen`, кладёт `gen_start` в ленту `events:{id}`, и только ПОТОМ идёт к модели —
 первый токен ленты `gen:{id}:{mid}` появляется лишь когда модель ответит. До этого ленты
 НЕ существует. Клиентский тейл ([`tail_generation`](../app/api/main.py)) на пустом `xread`
 (block=5000) проверял `exists(gen_key)` и, не найдя ленты, СДАВАЛСЯ. Если time-to-first-token
@@ -406,7 +408,7 @@ PEL (её без конца переобрабатывал reclaim). **Стал�
 Это НЕ структурный JSON под внешний сборщик, а простой текст «глазами»:
 ```
 2026-08-12 14:23:01 INFO     [chat.llm_worker] llm_worker started as host-42-a1b2c3 ...
-2026-08-12 14:23:07 WARNING  [chat.api] pubsub reconnect conv=… : ConnectionError(...)
+2026-08-12 14:23:07 WARNING  [chat.api] events tail reconnect conv=… : ConnectionError(...)
 2026-08-12 14:23:09 ERROR    [chat.llm_worker] process error msg_id=… (+ traceback)
 ```
 Все `print()` в `app/` заменены на логгеры компонентов (`chat.api`, `chat.llm_worker`,
@@ -524,7 +526,10 @@ fake-Redis):
 
 - **Реальный корп-SSO** не реализован — только шов `app/auth.py` (`auth_dev_mode=False`
   бросает `NotImplementedError`). Перед прод-контуром обязательно подключить.
-- **`user_message`-эхо** по-прежнему эфемерно (Pub/Sub) — при обрыве не переигрывается.
+- **Реконнект за пределами TTL лент** (`gen_ttl_seconds` / `events_ttl_seconds`) — токены и
+  эхо `user_message` уже недоступны для догона; клиент восстанавливает состояние
+  перезагрузкой истории из Postgres. В пределах TTL и то, и другое resumable (durable-ленты
+  `gen:{}` / `events:{}`, догон по `last_event_id`).
 - **Секреты/TLS**: Redis без пароля, Postgres `app/app`, порты наружу — для корп-контура
   ужесточить (пароли, сети, TLS) на уровне инфраструктуры.
 - **Шардирование inbound-стрима** не введено; гейт порядка решает корректность, но

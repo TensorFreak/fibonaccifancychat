@@ -89,11 +89,11 @@ await db.insert_message(conversation_id, "user", text, message_id)   # Postgres 
 added = await append_context(r, conversation_id,
                              {"role": "user", "content": text, "mid": message_id})  # ctx
 if added:                                                            # эхо только при реальной вставке
-    await r.publish(channel, json.dumps(
-        {"type": "user_message", "content": text, "message_id": message_id}))
+    await _emit_event(r, conversation_id,
+        {"type": "user_message", "content": text, "message_id": message_id})
 ```
 
-Сообщение уходит в Postgres (навсегда, вставка идемпотентна по `message_id`), в горячее окно `ctx:{id}` (для промпта) и эхом в Pub/Sub — чтобы **другие** устройства пользователя увидели его реплику. Эхо шлётся **только если** сообщение реально добавилось в окно (`added`), иначе на ретрае был бы дубль у клиента. Про `append_context` — см. [05. Горячий контекст](05-hot-context.md).
+Сообщение уходит в Postgres (навсегда, вставка идемпотентна по `message_id`), в горячее окно `ctx:{id}` (для промпта) и эхом в durable-ленту `events:{id}` — чтобы **другие** устройства пользователя увидели его реплику (и переиграли на реконнекте). Эхо шлётся **только если** сообщение реально добавилось в окно (`added`), иначе на ретрае был бы дубль у клиента. `_emit_event` = `XADD` в `events:{id}` с `MAXLEN ~` + `EXPIRE` (заменил прежний Pub/Sub `publish`). Про `append_context` — см. [05. Горячий контекст](05-hot-context.md).
 
 ### Шаг 2 — собрать промпт
 
@@ -117,7 +117,7 @@ if message_id and await db.assistant_exists(conversation_id, message_id):
 gen_message_id = str(uuid.uuid4())                        # отдельный id этой генерации
 gen_key = keys.gen_stream(conversation_id, gen_message_id)
 await r.set(keys.active_gen(conversation_id), gen_message_id, ex=settings.gen_ttl_seconds)
-await r.publish(channel, json.dumps({"type": "gen_start", "message_id": gen_message_id}))
+await _emit_event(r, conversation_id, {"type": "gen_start", "message_id": gen_message_id})  # в events:{id}
 
 parts = []
 async for token in stream_completion(prompt):
@@ -132,7 +132,7 @@ await r.expire(gen_key, settings.gen_ttl_seconds)
 await r.delete(keys.active_gen(conversation_id))
 ```
 
-Токены идут в durable Redis Stream, а не в эфемерный Pub/Sub — это делает поток resumable. `active_gen` + `gen_start` дают клиентам понять, какую ленту тейлить. Полный разбор — [07. Resumable streams](07-resumable-streams.md). Генерация обёрнута в `try/except`: при ошибке LLM лента завершается записью `end` с `error=1` и получает TTL — не утекает ([10](10-hardening.md), H3). **Пустой ответ** модели помечается тем же `error=1` и НЕ сохраняется как сообщение ассистента ([10](10-hardening.md), R5-2).
+Токены идут в durable Redis Stream `gen:{id}:{mid}` — это делает поток resumable. `active_gen` (маркер идущей генерации) + `gen_start` (событие в durable-ленте `events:{id}`) дают клиентам понять, какую ленту тейлить. Полный разбор — [07. Resumable streams](07-resumable-streams.md). Генерация обёрнута в `try/except`: при ошибке LLM лента завершается записью `end` с `error=1` и получает TTL — не утекает ([10](10-hardening.md), H3). **Пустой ответ** модели помечается тем же `error=1` и НЕ сохраняется как сообщение ассистента ([10](10-hardening.md), R5-2).
 
 ### Шаг 4 — сохранить ответ
 
@@ -166,7 +166,7 @@ if seq: await _mark_applied(r, conversation_id, seq)
 | Данные | Куда | Когда |
 |---|---|---|
 | сообщение юзера | Postgres + `ctx:{id}` | шаг 1 |
-| эхо `user_message` | Pub/Sub `conv:{id}` | шаг 1 |
+| эхо `user_message` | Stream `events:{id}` | шаг 1 |
 | токены ответа | Stream `gen:{id}:{mid}` | шаг 3 |
 | финальный ответ | Postgres + `ctx:{id}` | шаг 4 |
 | задача суммаризации | Stream `chat:summarize` | шаг 5 (по триггеру) |

@@ -210,12 +210,24 @@ async def _order_gate(r, conversation_id: str, seq: int, fields: dict) -> bool:
     return True
 
 
+async def _emit_event(r, conversation_id: str, event: dict):
+    """Публикует control-событие диалога в durable-ленту events:{id} (замена Pub/Sub).
+
+    В отличие от fire-and-forget Pub/Sub запись остаётся в ленте: подключившийся или
+    переподключившийся клиент переигрывает пропущенное по своему last_event_id. MAXLEN
+    ограничивает рост, EXPIRE продлевает окно догона на активности диалога (после
+    простоя лента протухает -> клиент восстановит состояние из Postgres)."""
+    ev_key = keys.events_stream(conversation_id)
+    await r.xadd(ev_key, {"data": json.dumps(event)},
+                 maxlen=settings.events_maxlen, approximate=True)
+    await r.expire(ev_key, settings.events_ttl_seconds)
+
+
 async def process(r, fields: dict):
     conversation_id = fields["conversation_id"]
     text = fields["text"]
     message_id = fields.get("message_id") or None       # None -> дедупа нет
     seq = int(fields.get("seq", 0) or 0)
-    channel = keys.conv_channel(conversation_id)
 
     # Порядок: применяем сообщения диалога строго по seq (см. _order_gate).
     if not await _order_gate(r, conversation_id, seq, fields):
@@ -258,8 +270,8 @@ async def process(r, fields: dict):
         added = await append_context(
             r, conversation_id, {"role": "user", "content": text, "mid": message_id})
         if added:
-            await r.publish(channel, json.dumps(
-                {"type": "user_message", "content": text, "message_id": message_id}))
+            await _emit_event(r, conversation_id,
+                {"type": "user_message", "content": text, "message_id": message_id})
 
         # 2) собираем ПРОМПТ = summary (из Redis/PG) + горячее окно (по токен-бюджету)
         prompt = await build_prompt(r, conversation_id)
@@ -272,8 +284,8 @@ async def process(r, fields: dict):
         gen_key = keys.gen_stream(conversation_id, gen_message_id)
         await r.set(keys.active_gen(conversation_id), gen_message_id,
                     ex=settings.gen_ttl_seconds)
-        await r.publish(channel, json.dumps(
-            {"type": "gen_start", "message_id": gen_message_id}))
+        await _emit_event(r, conversation_id,
+            {"type": "gen_start", "message_id": gen_message_id})
 
         parts: list[str] = []
         try:
