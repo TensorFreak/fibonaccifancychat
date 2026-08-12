@@ -82,6 +82,12 @@ class Settings(BaseSettings):
     summarize_group: str = "summarizers"
     summary_trigger_messages: int = 20   # каждые N новых сообщений — пересжать
     summary_recent_keep: int = 20        # столько последних НЕ сворачиваем (== окно)
+    # TTL замка суммаризации. Свёртка большого хвоста идёт несколькими LLM-вызовами и
+    # может быть долгой; замок продлевается heartbeat'ом (как в llm_worker), поэтому TTL —
+    # это запас на паузу heartbeat. Без продления замок истекал бы на лету, и второй
+    # суммаризатор дублировал бы работу (не потеря данных — save_summary идемпотентен по
+    # диапазону, — но лишний расход LLM). Валидатор требует lock_heartbeat < этого TTL.
+    summarize_lock_ttl_seconds: int = 300
 
     # --- БЕЗОПАСНОСТЬ / ЛИМИТЫ ---
     # Dev-режим авторизации: любой токен трактуется как личность пользователя
@@ -214,6 +220,10 @@ class Settings(BaseSettings):
             raise ValueError(
                 "lock_heartbeat_seconds must be < conv_lock_ttl_seconds "
                 "(heartbeat must renew the lock before its TTL expires)")
+        if self.lock_heartbeat_seconds >= self.summarize_lock_ttl_seconds:
+            raise ValueError(
+                "lock_heartbeat_seconds must be < summarize_lock_ttl_seconds "
+                "(heartbeat must renew the summarizer lock before its TTL expires)")
         if self.reclaim_min_idle_ms < self.conv_lock_ttl_seconds * 1000:
             raise ValueError(
                 "reclaim_min_idle_ms must be >= conv_lock_ttl_seconds*1000 "

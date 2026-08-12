@@ -24,7 +24,7 @@ from ..config import settings
 from ..redis_client import get_redis
 from ..migrate import migrate
 from .. import keys, db, tokens
-from ..locks import release_lock
+from ..locks import release_lock, heartbeat_lock
 from ..llm.client import stream_completion
 
 # Уникальное имя консьюмера на процесс: hostname+pid+rnd. Иначе при масштабировании
@@ -194,18 +194,6 @@ async def _order_gate(r, conversation_id: str, seq: int, fields: dict) -> bool:
     return True
 
 
-async def _heartbeat_lock(r, lock: str):
-    """Держим замок диалога живым во время долгой обработки: периодически продлеваем
-    TTL, пока владеем им. Без этого генерация дольше TTL освободила бы замок на лету,
-    и другой воркер (reclaim) начал бы дублирующую обработку."""
-    while True:
-        await asyncio.sleep(settings.lock_heartbeat_seconds)
-        if await r.get(lock) == CONSUMER_NAME:
-            await r.expire(lock, settings.conv_lock_ttl_seconds)
-        else:
-            return                                  # замок уже не наш — выходим
-
-
 async def process(r, fields: dict):
     conversation_id = fields["conversation_id"]
     text = fields["text"]
@@ -224,7 +212,9 @@ async def process(r, fields: dict):
     while not await r.set(lock, CONSUMER_NAME, nx=True,
                           ex=settings.conv_lock_ttl_seconds):
         await asyncio.sleep(0.2)
-    hb = asyncio.create_task(_heartbeat_lock(r, lock))
+    hb = asyncio.create_task(heartbeat_lock(
+        r, lock, CONSUMER_NAME,
+        settings.conv_lock_ttl_seconds, settings.lock_heartbeat_seconds))
 
     try:
         # ПЕРЕПРОВЕРКА ПОРЯДКА ПОД ЗАМКОМ: пока ждали замок, этот тур мог быть

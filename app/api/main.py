@@ -219,9 +219,17 @@ async def tail_generation(ws: WebSocket, r, conversation_id: str,
         while True:
             resp = await r.xread({gen_key: last_id}, block=5000, count=200)
             if not resp:
-                # таймаут ожидания: если ленты уже нет (истёк gen_ttl) — выходим
+                # Ленты нет по ДВУМ разным причинам, и их нельзя путать:
+                #   1) она ЕЩЁ не создана — первый токен не пришёл (TTFT дольше block:
+                #      на большом контексте/медленной модели это норма);
+                #   2) она уже ПРОТУХЛА (истёк gen_ttl после завершения).
+                # Сдаёмся только во 2-м случае. Признак «генерация ещё идёт» — active_gen
+                # указывает на ИМЕННО эту генерацию (ставится ДО gen_start, снимается по
+                # завершении). Иначе клиент, подключившийся до первого токена, бросал бы
+                # тейл и навсегда завис бы с пустым «пишет…» баблом, хотя ответ идёт.
                 if not await r.exists(gen_key):
-                    return
+                    if await r.get(keys.active_gen(conversation_id)) != message_id:
+                        return
                 continue
             for _key, entries in resp:
                 for entry_id, fields in entries:

@@ -21,7 +21,7 @@ from ..config import settings
 from ..redis_client import get_redis
 from ..migrate import migrate
 from .. import keys, db, tokens
-from ..locks import release_lock
+from ..locks import release_lock, heartbeat_lock
 from ..llm.client import complete
 
 # Уникальное имя консьюмера на процесс (см. пояснение в llm_worker).
@@ -73,11 +73,16 @@ async def summarize(r, conversation_id: str):
     # лёгкий замок именно на суммаризацию (не пересекается с замком ответа в llm_worker),
     # чтобы две задачи по одному диалогу не сворачивали одно и то же дважды.
     # Значение — уникальный токен владельца (CONSUMER_NAME), чтобы снять ТОЛЬКО свой
-    # замок (см. release_lock, C2): свёртка большого хвоста несколькими LLM-вызовами
-    # может превысить TTL, и тогда безусловный DEL снёс бы чужой замок.
+    # замок (см. release_lock, C2). Свёртка большого хвоста идёт несколькими LLM-вызовами
+    # и может быть долгой, поэтому замок продлеваем heartbeat'ом (как в llm_worker): без
+    # этого он истёк бы на лету, и второй суммаризатор дублировал бы работу (лишний LLM).
     lock = f"lock:sum:{conversation_id}"
-    if not await r.set(lock, CONSUMER_NAME, nx=True, ex=120):
+    if not await r.set(lock, CONSUMER_NAME, nx=True,
+                       ex=settings.summarize_lock_ttl_seconds):
         return
+    hb = asyncio.create_task(heartbeat_lock(
+        r, lock, CONSUMER_NAME,
+        settings.summarize_lock_ttl_seconds, settings.lock_heartbeat_seconds))
     try:
         old_summary, upto_id = await db.get_summary(conversation_id)
 
@@ -111,6 +116,7 @@ async def summarize(r, conversation_id: str):
                          {"conversation_id": conversation_id},
                          maxlen=settings.summarize_stream_maxlen, approximate=True)
     finally:
+        hb.cancel()                                  # остановить продление до снятия
         await release_lock(r, lock, CONSUMER_NAME)   # снять только свой замок (C2)
 
 
