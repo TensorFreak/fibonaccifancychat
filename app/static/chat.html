@@ -106,6 +106,7 @@ let items = [];                                     // [{id, title, created_at}]
 const bubbles = {};                                 // message_id -> элемент бабла
 let lastEventId = "$";                              // курсор ленты событий (догон на реконнекте)
 let seenUser = new Set();                           // message_id эх user_message (идемпотентность)
+let reconnectAttempts = 0;                          // для бэкоффа+джиттера реконнекта (N1-review)
 
 function authHeaders(){ return {"Authorization":"Bearer "+token, "Content-Type":"application/json"}; }
 async function api(path, opts={}){
@@ -259,10 +260,21 @@ function connect(id){
   const q = "token=" + encodeURIComponent(token) +
             (lastEventId ? "&last_event_id=" + encodeURIComponent(lastEventId) : "");
   ws = new WebSocket(`${proto}://${location.host}/ws/${id}?${q}`);
-  ws.onopen  = () => { $("status").textContent="онлайн"; $("status").className="on"; };
+  ws.onopen  = () => {
+    $("status").textContent="онлайн"; $("status").className="on";
+    reconnectAttempts = 0;   // успешный коннект -> сбросить бэкофф (N1-review)
+  };
   ws.onclose = () => {
     $("status").textContent="оффлайн"; $("status").className="off";
-    setTimeout(()=>{ reconnect(id); }, 1500);   // авто-реконнект с ресинком (M1-review)
+    // БЭКОФФ + ДЖИТТЕР (N1-review). Ресинк истории при реконнекте (M1) сохраняется —
+    // корректность важнее экономии, — но реконнект больше не синхронный: при массовом
+    // обрыве (рестарт реплики api роняет тысячи сокетов РАЗОМ) синхронный ресинк дал бы
+    // всплеск GET-истории в одну секунду. Джиттер размазывает всплеск во времени, а
+    // экспоненциальный бэкофф щадит бэкенд, если он недоступен надолго. Первый реконнект
+    // ~1–2 c (как раньше), далее 2/4/8…до 15 c + случайные 0–1000 мс.
+    const delay = Math.min(1000 * 2 ** reconnectAttempts, 15000) + Math.random() * 1000;
+    reconnectAttempts++;
+    setTimeout(()=>{ reconnect(id); }, delay);   // авто-реконнект с ресинком (M1-review)
   };
   ws.onmessage = (ev) => {
     const e = JSON.parse(ev.data);
