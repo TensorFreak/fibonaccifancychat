@@ -40,26 +40,42 @@ if n >= settings.summary_trigger_messages:                     # 20
 Тот же паттерн consumer group, что и у llm_worker, но своя группа `summarizers` (независимость от горячего пути):
 
 ```python
-resp = await r.xreadgroup(summarize_group, "summarizer-1",
+resp = await r.xreadgroup(summarize_group, CONSUMER_NAME,   # уникально на процесс: hostname-pid-rnd
                           {summarize_stream: ">"}, count=1, block=5000)
-# ... summarize(conversation_id) ... XACK
+# ... handle(conversation_id) ... XACK   (handle диспетчеризует summarize / generate_title)
 ```
+
+Как и llm_worker, суммаризатор периодически делает `reclaim_stale` (`XAUTOCLAIM`) по
+зависшим в PEL задачам, а «отравленную» (постоянно падающую) после `max_deliveries`
+переносит в `chat:summarize:dead` (см. [10. Харденинг](10-hardening.md), R5-4).
 
 ## Замок суммаризации
 
 ```python
 lock = f"lock:sum:{conversation_id}"
-if not await r.set(lock, "1", nx=True, ex=120):
-    return           # уже сворачивается -> просто выходим
+if not await r.set(lock, CONSUMER_NAME, nx=True, ex=settings.summarize_lock_ttl_seconds):
+    return                                   # уже сворачивается -> просто выходим
+hb = asyncio.create_task(heartbeat_lock(     # продлеваем замок во время долгой свёртки
+    r, lock, CONSUMER_NAME, settings.summarize_lock_ttl_seconds, settings.lock_heartbeat_seconds))
+# ... в finally: hb.cancel(); await release_lock(r, lock, CONSUMER_NAME)
 ```
 
-Отдельный замок, **не пересекается** с `lock:conv:{id}` из llm_worker (это разные подсистемы). Нужен, чтобы две задачи по одному диалогу не свернули одно и то же дважды. Важное отличие от воркера ответа: здесь при занятом замке мы **не ждём**, а сразу выходим — свёртка не срочная, следующий триггер её и так запустит.
+Отдельный замок, **не пересекается** с `lock:conv:{id}` из llm_worker (это разные
+подсистемы). Нужен, чтобы две задачи по одному диалогу не свернули одно и то же дважды.
+Значение замка — уникальный `CONSUMER_NAME`, снимаем его owner-aware (`release_lock`, Lua
+compare-and-delete), а во время долгой свёртки большого хвоста замок продлевается
+heartbeat'ом — иначе истёк бы на лету и второй суммаризатор дублировал бы работу
+([10. Харденинг](10-hardening.md), C2/R4-M1). Важное отличие от воркера ответа: здесь при
+занятом замке мы **не ждём**, а сразу выходим — свёртка не срочная, следующий триггер её и
+так запустит.
 
 ## Что именно сворачивается
 
 ```python
 old_summary, upto_id = await db.get_summary(conversation_id)
-pending = await db.load_messages_since(conversation_id, upto_id)   # ещё не в summary
+# ещё не в summary (id > watermark), с лимитом summary_max_fetch на заход (защита от OOM,
+# если суммаризатор далеко отстал; хвост длиннее — дозапустит сам себя)
+pending = await db.load_messages_since(conversation_id, upto_id, settings.summary_max_fetch)
 to_fold = pending[:-settings.summary_recent_keep] if \
     len(pending) > settings.summary_recent_keep else []
 if not to_fold:
@@ -93,8 +109,8 @@ async def fold(old_summary, messages):
 
 Три уровня контроля длины (см. [08. Контроль длины](08-token-budget.md)):
 
-1. **Чанкинг входа** — `chunk_messages` бьёт хвост на части ≤ `summary_fold_chunk_tokens` (4000), каждая вкатывается в резюме отдельным шагом. Промпт суммаризатора больше не взрывается.
-2. **Потолок в промпте** — модель просят уложиться в `summary_max_tokens` (512).
+1. **Чанкинг входа** — `chunk_messages` бьёт хвост на части ≤ `summary_fold_chunk_tokens` (8000), каждая вкатывается в резюме отдельным шагом. Промпт суммаризатора больше не взрывается.
+2. **Потолок в промпте** — модель просят уложиться в `summary_max_tokens` (2000).
 3. **Жёсткая обрезка** — `truncate_text` подстраховывает, если модель проигнорила инструкцию. Так `summary` не разрастается от свёртки к свёртке (а он идёт в **каждый** промпт ответа).
 
 ## Сохранение результата
@@ -121,8 +137,10 @@ await r.set(keys.sum_key(conversation_id), new_summary, ex=settings.ctx_ttl_seco
 |---|---|---|
 | `summary_trigger_messages` | 20 | порог запуска (в сообщениях) |
 | `summary_recent_keep` | 20 | сколько последних не сворачивать |
-| `summary_max_tokens` | 512 | потолок объёма резюме |
-| `summary_fold_chunk_tokens` | 4000 | размер чанка при свёртке большого хвоста |
+| `summary_max_tokens` | 2000 | потолок объёма резюме |
+| `summary_fold_chunk_tokens` | 8000 | размер чанка при свёртке большого хвоста |
+| `summary_max_fetch` | 5000 | потолок вычитки несвёрнутого хвоста за заход |
+| `summarize_lock_ttl_seconds` | 300 | TTL замка суммаризации (+heartbeat) |
 
 ## Границы
 

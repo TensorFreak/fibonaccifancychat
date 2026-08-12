@@ -13,15 +13,24 @@ Redis LIST, элементы — JSON вида `{"role": "user"|"assistant", "co
 ## Запись: `append_context`
 
 ```python
-async def append_context(r, conversation_id, message):
+async def append_context(r, conversation_id, message):   # message = {role, content, mid}
     key = keys.ctx_key(conversation_id)
+    if message.get("mid"):                               # ИДЕМПОТЕНТНОСТЬ: при ретрае
+        for raw in await r.lrange(key, 0, -1):           # то же (mid, role) не задваиваем
+            e = json.loads(raw)
+            if e.get("mid") == message["mid"] and e.get("role") == message["role"]:
+                return False                             # уже в окне
     await r.rpush(key, json.dumps(message))              # добавить в хвост
     await r.ltrim(key, -settings.ctx_max_messages, -1)   # держать только последние N
     await r.expire(key, settings.ctx_ttl_seconds)        # продлить жизнь при активности
+    return True                                          # реально добавили
 ```
 
-Три операции на каждое сообщение:
+На каждое сообщение:
 
+0. **Дедуп по `mid`+`role`** — при переобработке (at-least-once) то же сообщение не
+   задваивается в окне. Возвращаемый флаг (`True` = реально добавили) решает, слать ли
+   эхо `user_message` и крутить ли счётчик суммаризации. Всё под замком диалога — гонок нет.
 1. `RPUSH` — дописать сообщение в конец окна.
 2. `LTRIM (-N, -1)` — оставить только последние N. Всё, что «выпало» из окна, **не теряется**: оно в Postgres и позже будет свёрнуто суммаризатором в `summary`.
 3. `EXPIRE` — продлить TTL. Пока диалог активен — окно живёт; 30 мин тишины — протухает.
@@ -48,7 +57,9 @@ async def load_context(r, conversation_id):
 - **Cache hit** — окно в Redis есть, читаем `LRANGE` и возвращаем.
 - **Cache miss** — пользователь вернулся после простоя, окно протухло по TTL. Тянем последние N сообщений из Postgres (`load_recent_messages`), прогреваем кэш и ставим новый TTL. Со следующего хода снова быстрый путь.
 
-Регидратация из Postgres опирается на индекс `idx_messages_conv_time (conversation_id, created_at DESC)` — см. [09. Модель хранения](09-storage-model.md).
+Регидратация из Postgres опирается на индекс `idx_messages_conv_id (conversation_id, id)`:
+`load_recent_messages` берёт последние N по **`id DESC`** (монотонный, устойчив к одинаковым
+таймстампам) и разворачивает в хронологию. См. [09. Модель хранения](09-storage-model.md).
 
 ## Место в сборке промпта
 

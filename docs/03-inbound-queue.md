@@ -19,10 +19,15 @@ Redis Stream + consumer group закрывает всё три пункта. Pub
 
 ```python
 seq = await r.incr(keys.conv_seq(conversation_id))   # монотонный номер (FIFO-порядок)
+await r.expire(keys.conv_seq(conversation_id), settings.conv_counter_ttl_seconds)  # idle-TTL счётчика
 await r.xadd(settings.inbound_stream, {
     "conversation_id": ..., "user_id": ..., "message_id": ..., "seq": str(seq), "text": ...,
-})
+}, maxlen=settings.inbound_stream_maxlen, approximate=True)   # MAXLEN ~ ограничивает рост стрима
 ```
+
+`user_id` берёт **сервер** из JWT (не из тела сообщения — тело несёт только `{text}`);
+`message_id` — свежий UUID (ключ идемпотентности). Всё обращение к Redis обёрнуто так, что
+транзиентный сбой Redis не роняет вебсокет (клиенту уходит `server_busy`, [10](10-hardening.md), R5-1).
 
 Поле `seq` — монотонный номер сообщения в диалоге; воркер применяет их строго по
 возрастанию (FIFO-гейт, см. [04](04-llm-worker.md) и [10. Харденинг](10-hardening.md), H1).
@@ -44,7 +49,7 @@ resp = await r.xreadgroup(
 - Consumer group гарантирует: **каждая запись достаётся ровно одному воркеру**. Запусти N копий — Redis раздаст им разные сообщения. Это и есть горизонтальное масштабирование обработки.
 - `block=5000` — блокирующее ожидание до 5 c: нет сообщений → цикл повторяется, CPU не жжётся.
 
-`CONSUMER_NAME` сейчас захардкожен `"worker-1"`; в проде должен быть уникален на инстанс (hostname/uuid), иначе PEL двух воркеров смешается.
+`CONSUMER_NAME` уникален на процесс — `f"{hostname}-{pid}-{rnd}"` — иначе PEL/`XAUTOCLAIM` двух реплик смешались бы.
 
 ## Создание группы (идемпотентно)
 
@@ -64,14 +69,16 @@ await r.xgroup_create(settings.inbound_stream, settings.consumer_group,
 try:
     await process(r, fields)
     await r.xack(settings.inbound_stream, settings.consumer_group, msg_id)
-except Exception as e:
-    print("process error:", repr(e))   # НЕ ackаем
+except Exception:
+    log.exception("process error msg_id=%s", msg_id)   # НЕ ackаем (лог с трейсбеком)
 ```
 
 - Успех → `XACK` убирает запись из **PEL** (Pending Entries List — список выданных, но не подтверждённых).
 - Ошибка → **не** ackаем. Запись остаётся в PEL и может быть переобработана.
 
 Отсюда следствие: обработка должна быть устойчива к повтору. Идемпотентность обеспечена: вставки в Postgres идут через `INSERT … ON CONFLICT` по уникальному `(message_id, role)`, горячее окно дедуплицируется по `mid`, а повторное применение уже применённого `seq` отсекается гейтом порядка. Разбор — в [10. Харденинг](10-hardening.md), C3.
+
+**Dead-letter:** если задача падает раз за разом («отравленная»), она бы вечно висела в PEL. `reclaim_stale` считает попытки доставки (счётчик PEL) и после `max_deliveries` уводит задачу в `chat:inbound:dead` + `XACK` — очередь не застревает. Разбирать: `XRANGE chat:inbound:dead - +`. См. [10](10-hardening.md), R5-4.
 
 ## Восстановление зависших задач
 
@@ -98,10 +105,11 @@ FIFO-гейту порядка, если предшественник застр
 | `summarize_stream` | `chat:summarize` | стрим задач суммаризации |
 | `summarize_group` | `summarizers` | группа суммаризаторов |
 
+## Уже реализовано (было в «точках роста»)
+
+- **Ограничение длины стрима** — `XADD ... MAXLEN ~ inbound_stream_maxlen` (100000). Без него обработанные записи копили бы память (`XACK` убирает из PEL, но не из стрима). Рейтлимит ws-сообщений per-user ([10](10-hardening.md), H2) не даёт одному клиенту переполнить общий стрим и вытеснить чужие сообщения.
+- **Reaper зависших задач** (`XAUTOCLAIM`), **dead-letter** отравленных и уникальный `CONSUMER_NAME` — см. [10. Харденинг](10-hardening.md).
+
 ## Точки роста
 
-- **Шардирование.** Один стрим — единая точка нагрузки. На масштабе: `chat:inbound:{hash(conversation_id) % K}`, K групп/наборов воркеров. (FIFO-порядок уже обеспечен гейтом по `seq`, но единый стрим остаётся точкой нагрузки.)
-- **Ограничение длины стрима** (`XADD ... MAXLEN ~`), чтобы обработанные, но не обрезанные записи не копили память (хотя `XACK` их из PEL убирает, сами записи остаются в стриме до тримминга).
-
-Reaper зависших задач (`XAUTOCLAIM`) и уникальный `CONSUMER_NAME` — уже реализованы,
-см. [10. Харденинг](10-hardening.md).
+- **Шардирование.** Один стрим — единая точка нагрузки. На масштабе: `chat:inbound:{hash(conversation_id) % K}`, K групп/наборов воркеров. (FIFO-порядок уже обеспечен гейтом по `seq`, но единый стрим остаётся точкой нагрузки.) Не реализовано — осознанное упрощение.

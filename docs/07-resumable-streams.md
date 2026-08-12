@@ -22,51 +22,69 @@
 ## Сторона воркера (продюсер)
 
 ```python
-message_id = str(uuid.uuid4())
-gen_key = keys.gen_stream(conversation_id, message_id)
+gen_message_id = str(uuid.uuid4())                       # отдельный id ЭТОЙ генерации
+gen_key = keys.gen_stream(conversation_id, gen_message_id)
 
-await r.set(keys.active_gen(conversation_id), message_id, ex=settings.gen_ttl_seconds)
-await r.publish(channel, json.dumps({"type": "gen_start", "message_id": message_id}))
+await r.set(keys.active_gen(conversation_id), gen_message_id, ex=settings.gen_ttl_seconds)
+await r.publish(channel, json.dumps({"type": "gen_start", "message_id": gen_message_id}))
 
+parts = []
 async for token in stream_completion(prompt):
-    await r.xadd(gen_key, {"t": "token", "c": token})   # durable дельта
-await r.xadd(gen_key, {"t": "end"})                     # терминальная запись
+    parts.append(token)
+    await r.xadd(gen_key, {"t": "token", "c": token})    # durable дельта
+    # H1: пока лента наполняется, держим на ней active-TTL (gen_active_ttl_seconds),
+    # чтобы при жёстком падении воркера она не осталась без TTL навсегда.
+    if len(parts) == 1 or len(parts) % 256 == 0:
+        await r.expire(gen_key, settings.gen_active_ttl_seconds)
+
+empty = not "".join(parts).strip()                       # пустой ответ -> помечаем ошибкой
+await r.xadd(gen_key, {"t": "end", "error": "1"} if empty else {"t": "end"})  # терминал
 await r.expire(gen_key, settings.gen_ttl_seconds)
 await r.delete(keys.active_gen(conversation_id))
 ```
 
-- `active_gen:{id}` — маркер «идёт генерация X». По нему подключающийся клиент узнаёт, какую ленту догонять. Свой TTL — чтобы не завис, если воркер умрёт.
+- `active_gen:{id}` — маркер «идёт генерация X». По нему подключающийся клиент узнаёт, какую ленту догонять; он же служит признаком «генерация ещё активна» для тейла (см. ниже). Свой TTL — чтобы не завис, если воркер умрёт.
 - `gen_start` в Pub/Sub — сигнал уже подключённым сокетам начать тейл. Если сигнал потеряется (Pub/Sub), клиент восстановит `message_id` из `active_gen` при подключении — дублирующая гарантия.
-- Каждый токен → запись `{"t":"token","c":...}`. Финал → запись `{"t":"end"}`.
-- После завершения лента живёт `gen_ttl_seconds` (300 c): в этом окне реконнект переиграет **даже полностью готовый** ответ. Затем `EXPIRE` её убирает.
+- Каждый токен → запись `{"t":"token","c":...}`. Финал → запись `{"t":"end"}` (с `error=1`, если ответ модели пустой — [10](10-hardening.md), R5-2).
+- Во время генерации у ленты active-TTL `gen_active_ttl_seconds` (900 c), после завершения — `gen_ttl_seconds` (300 c): в этом окне реконнект переиграет **даже полностью готовый** ответ. Затем `EXPIRE` её убирает.
 
 ## Сторона api (консьюмер): `tail_generation`
 
 ```python
-async def tail_generation(ws, r, conversation_id, message_id, tailing):
+# send — сериализованная отправка в сокет (общий asyncio.Lock, см. [02])
+async def tail_generation(ws, r, conversation_id, message_id, tailing, send):
     if message_id in tailing:      # защита от двойного тейла одной генерации
         return
     tailing.add(message_id)
     gen_key = keys.gen_stream(conversation_id, message_id)
     try:
-        await ws.send_text(json.dumps({"type": "assistant_start", "message_id": message_id}))
+        await send(json.dumps({"type": "assistant_start", "message_id": message_id}))
         last_id = "0"                                    # "0" => лента с начала
         while True:
             resp = await r.xread({gen_key: last_id}, block=5000, count=200)
             if not resp:
-                if not await r.exists(gen_key):          # ленты нет (истёк TTL) -> выходим
-                    return
+                # Ленты нет по ДВУМ разным причинам — их нельзя путать:
+                #   1) она ЕЩЁ не создана — первый токен не пришёл (TTFT дольше block,
+                #      норма для большого контекста/медленной модели);
+                #   2) она уже ПРОТУХЛА (истёк gen_ttl после завершения).
+                # Сдаёмся только во 2-м случае: признак «генерация ещё идёт» —
+                # active_gen указывает на ИМЕННО эту генерацию (R4-H1). Иначе клиент,
+                # подключившийся до первого токена, бросил бы тейл и завис бы с пустым баблом.
+                if not await r.exists(gen_key):
+                    if await r.get(keys.active_gen(conversation_id)) != message_id:
+                        return
                 continue
             for _key, entries in resp:
                 for entry_id, fields in entries:
                     last_id = entry_id
                     if fields.get("t") == "end":
-                        await ws.send_text(json.dumps({"type": "assistant_end",
-                                                       "message_id": message_id}))
+                        await send(json.dumps({"type": "assistant_end",
+                                               "message_id": message_id,
+                                               "error": fields.get("error", "")}))
                         return
-                    await ws.send_text(json.dumps({"type": "token",
-                                                   "content": fields.get("c", ""),
-                                                   "message_id": message_id}))
+                    await send(json.dumps({"type": "token",
+                                           "content": fields.get("c", ""),
+                                           "message_id": message_id}))
     finally:
         tailing.discard(message_id)
 ```
@@ -75,8 +93,10 @@ async def tail_generation(ws, r, conversation_id, message_id, tailing):
 
 1. `last_id = "0"` — первый `XREAD` вернёт **все** уже накопленные токены (реплей с начала).
 2. `last_id` двигается на id последней прочитанной записи; следующий `XREAD BLOCK` ждёт **новые** токены (live).
-3. Запись `end` → шлём `assistant_end` и выходим.
-4. Таймаут + ленты уже нет (`not exists`) → генерация давно завершена и лента истекла по TTL → выходим.
+3. Запись `end` → шлём `assistant_end` (с полем `error`) и выходим.
+4. Таймаут + ленты нет: если генерация **ещё активна** (`active_gen` = наш `message_id`) —
+   ждём дальше (лента ещё не создана, TTFT); если уже **не активна** — лента истекла по
+   TTL, выходим ([10](10-hardening.md), R4-H1).
 
 ## Два триггера тейла
 
@@ -101,6 +121,7 @@ async def tail_generation(ws, r, conversation_id, message_id, tailing):
 | Сценарий | Поведение |
 |---|---|
 | Обычная генерация при живом сокете | `gen_start` → тейл с `"0"` → реплей (пусто) + live-хвост |
+| Подключение/тейл **до первого токена** (долгий TTFT) | ленты ещё нет, но `active_gen`=наш id → тейл **ждёт**, не сдаётся (R4-H1) |
 | Реконнект **посреди** генерации | `active_gen` есть → тейл с `"0"` → реплей уже сгенерённого + live |
 | Реконнект **после** завершения (в пределах TTL) | лента ещё жива → реплей полного ответа с `assistant_end` |
 | Реконнект после TTL | ленты нет → тейл не стартует; полный ответ берётся перезагрузкой истории из Postgres |

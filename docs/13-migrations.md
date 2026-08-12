@@ -47,10 +47,11 @@ python -m app.migrate
 
 ## Как добавить миграцию
 
-1. Создать файл со следующим номером, напр. `migrations/0003_add_titles.sql`:
+1. Создать файл со следующим свободным номером (сейчас применены `0001`–`0003`, значит
+   следующий — `0004`), напр. `migrations/0004_add_something.sql`:
    ```sql
-   -- 0003_add_titles: заголовки диалогов
-   ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title TEXT;
+   -- 0004_add_something: пример
+   ALTER TABLE conversations ADD COLUMN IF NOT EXISTS something TEXT;
    ```
 2. Всё. При следующем старте (или `python -m app.migrate`) она применится один раз.
 
@@ -71,5 +72,5 @@ python -m app.migrate
 она просто отметится применённой без изменений. Колонки/индексы, добавленные позже
 (`message_id`, дедуп-индекс, индекс пагинации), приезжают своими миграциями.
 
-Проверено: на чистой БД применяются `0001`+`0002`; повторный прогон — `up to date`;
-`schema_migrations` содержит обе версии.
+Проверено: на чистой БД применяются `0001`+`0002`+`0003`; повторный прогон — `up to date`;
+`schema_migrations` содержит все версии.

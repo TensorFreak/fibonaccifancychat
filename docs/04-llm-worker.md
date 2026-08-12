@@ -29,9 +29,13 @@ while True:
             try:
                 await process(r, fields)
                 await r.xack(inbound, group, msg_id)   # подтвердить
-            except Exception as e:
-                print("process error:", repr(e))       # НЕ ackать -> PEL -> повтор
+            except Exception:
+                log.exception("process error msg_id=%s", msg_id)  # НЕ ackать -> PEL -> повтор
 ```
+
+Логи — читаемый однострочный формат в stdout (`app/log.py`); ошибки — с трейсбеком
+(`log.exception`). «Отравленную» задачу, падающую раз за разом, `reclaim_stale` после
+`max_deliveries` уводит в `chat:inbound:dead` (dead-letter, [10](10-hardening.md), R5-4).
 
 Про `xreadgroup`, `">"`, `XACK` и PEL — см. [03. Очередь входящих](03-inbound-queue.md).
 
@@ -43,15 +47,17 @@ while True:
 lock = keys.conv_lock(conversation_id)
 while not await r.set(lock, CONSUMER_NAME, nx=True, ex=settings.conv_lock_ttl_seconds):
     await asyncio.sleep(0.2)
-hb = asyncio.create_task(_heartbeat_lock(r, lock))   # продлеваем TTL во время генерации
+hb = asyncio.create_task(heartbeat_lock(             # продлеваем TTL во время генерации
+    r, lock, CONSUMER_NAME, settings.conv_lock_ttl_seconds, settings.lock_heartbeat_seconds))
+# ... в finally: hb.cancel(); await release_lock(r, lock, CONSUMER_NAME)
 ```
 
 Пользователь мог прислать 2–3 сообщения подряд, пока шла генерация. Их разберут **разные** воркеры. Без сериализации они бы перемешали контекст (ответ на второе сообщение попал бы в историю раньше первого). Замок `lock:conv:{id}` гарантирует: сообщения одного диалога обрабатываются строго по очереди.
 
-- `SET ... NX EX` — атомарный захват с TTL `conv_lock_ttl_seconds` (300 c).
-- **Heartbeat:** долгая генерация (большой контекст) может идти дольше TTL; фоновая задача продлевает замок, пока владеем им, — иначе замок истёк бы на лету и другой воркер начал бы дублирующую обработку ([10](10-hardening.md)).
+- `SET ... NX EX` — атомарный захват с TTL `conv_lock_ttl_seconds` (300 c). Значение — уникальный `CONSUMER_NAME` владельца.
+- **Heartbeat:** долгая генерация (большой контекст) может идти дольше TTL; фоновая задача (`heartbeat_lock` из `app/locks.py`) продлевает замок, пока **владеем** им, — иначе замок истёк бы на лету и другой воркер начал бы дублирующую обработку ([10](10-hardening.md)).
 - Не смогли захватить → ждём 0.2 c и пробуем снова (простой честный spin-wait).
-- Снимается в `finally` (`DELETE`), heartbeat отменяется там же.
+- Снимается в `finally` через **`release_lock`** — owner-aware (Lua compare-and-delete: снимаем ТОЛЬКО свой замок, не чужой, перехваченный после истечения TTL на лету, [10](10-hardening.md), C2). Heartbeat отменяется там же.
 
 > Параллелизм — **между** диалогами. **Внутри** одного диалога — строго последовательно. Это by design.
 
@@ -62,12 +68,15 @@ hb = asyncio.create_task(_heartbeat_lock(r, lock))   # продлеваем TTL 
 ### Шаг 1 — сохранить сообщение пользователя
 
 ```python
-await db.insert_message(conversation_id, "user", text)        # Postgres (истина)
-await append_context(r, conversation_id, {"role": "user", "content": text})  # ctx
-await r.publish(channel, json.dumps({"type": "user_message", "content": text}))
+await db.insert_message(conversation_id, "user", text, message_id)   # Postgres (истина), идемпотентно
+added = await append_context(r, conversation_id,
+                             {"role": "user", "content": text, "mid": message_id})  # ctx
+if added:                                                            # эхо только при реальной вставке
+    await r.publish(channel, json.dumps(
+        {"type": "user_message", "content": text, "message_id": message_id}))
 ```
 
-Сообщение уходит в Postgres (навсегда), в горячее окно `ctx:{id}` (для промпта) и эхом в Pub/Sub — чтобы **другие** устройства пользователя увидели его реплику. Про `append_context` — см. [05. Горячий контекст](05-hot-context.md).
+Сообщение уходит в Postgres (навсегда, вставка идемпотентна по `message_id`), в горячее окно `ctx:{id}` (для промпта) и эхом в Pub/Sub — чтобы **другие** устройства пользователя увидели его реплику. Эхо шлётся **только если** сообщение реально добавилось в окно (`added`), иначе на ретрае был бы дубль у клиента. Про `append_context` — см. [05. Горячий контекст](05-hot-context.md).
 
 ### Шаг 2 — собрать промпт
 
@@ -79,43 +88,61 @@ prompt = await build_prompt(r, conversation_id)
 
 ### Шаг 3 — генерация в durable-ленту
 
+Перед генерацией — идемпотентность ВСЕГО хода: если ответ на этот `message_id` уже в БД
+(воркер упал после вставки ответа, но до отметки `applied`, и задачу переиграли), НЕ
+генерируем повторно — иначе второй платный вызов LLM и расхождение клиент/БД ([10](10-hardening.md), R3-M2):
+
 ```python
-message_id = str(uuid.uuid4())
-gen_key = keys.gen_stream(conversation_id, message_id)
-await r.set(keys.active_gen(conversation_id), message_id, ex=settings.gen_ttl_seconds)
-await r.publish(channel, json.dumps({"type": "gen_start", "message_id": message_id}))
+if message_id and await db.assistant_exists(conversation_id, message_id):
+    if seq: await _mark_applied(r, conversation_id, seq)   # досдвигаем порядок и выходим
+    return
+
+gen_message_id = str(uuid.uuid4())                        # отдельный id этой генерации
+gen_key = keys.gen_stream(conversation_id, gen_message_id)
+await r.set(keys.active_gen(conversation_id), gen_message_id, ex=settings.gen_ttl_seconds)
+await r.publish(channel, json.dumps({"type": "gen_start", "message_id": gen_message_id}))
 
 parts = []
 async for token in stream_completion(prompt):
     parts.append(token)
     await r.xadd(gen_key, {"t": "token", "c": token})     # durable дельта
+    if len(parts) == 1 or len(parts) % 256 == 0:          # H1: active-TTL пока лента растёт
+        await r.expire(gen_key, settings.gen_active_ttl_seconds)
 answer = "".join(parts)
-await r.xadd(gen_key, {"t": "end"})                       # терминальная запись
+empty = not answer.strip()                                # пустой ответ -> помечаем ошибкой
+await r.xadd(gen_key, {"t": "end", "error": "1"} if empty else {"t": "end"})   # терминал
 await r.expire(gen_key, settings.gen_ttl_seconds)
 await r.delete(keys.active_gen(conversation_id))
 ```
 
-Токены идут в durable Redis Stream, а не в эфемерный Pub/Sub — это делает поток resumable. `active_gen` + `gen_start` дают клиентам понять, какую ленту тейлить. Полный разбор — [07. Resumable streams](07-resumable-streams.md). Генерация обёрнута в `try/except`: при ошибке LLM лента завершается записью `end` с `error=1` и получает TTL — не утекает ([10](10-hardening.md), H3).
+Токены идут в durable Redis Stream, а не в эфемерный Pub/Sub — это делает поток resumable. `active_gen` + `gen_start` дают клиентам понять, какую ленту тейлить. Полный разбор — [07. Resumable streams](07-resumable-streams.md). Генерация обёрнута в `try/except`: при ошибке LLM лента завершается записью `end` с `error=1` и получает TTL — не утекает ([10](10-hardening.md), H3). **Пустой ответ** модели помечается тем же `error=1` и НЕ сохраняется как сообщение ассистента ([10](10-hardening.md), R5-2).
 
 ### Шаг 4 — сохранить ответ
 
 ```python
-await db.insert_message(conversation_id, "assistant", answer)
-await append_context(r, conversation_id, {"role": "assistant", "content": answer})
+inserted = await db.insert_message(conversation_id, "assistant", answer, message_id)  # тот же message_id, роль различает строки
+await append_context(r, conversation_id, {"role": "assistant", "content": answer, "mid": message_id})
 ```
 
-Финальный ответ — в Postgres (истина) и в горячее окно.
+Финальный ответ — в Postgres (истина, идемпотентно по `(message_id, 'assistant')`) и в горячее окно. `inserted` (реально вставлено, а не дубль-ретрай) решает, крутить ли триггер суммаризации и авто-название (шаг 5).
 
 ### Шаг 5 — триггер суммаризации
 
 ```python
-n = await r.incrby(keys.since_sum_key(conversation_id), 2)   # +user +assistant
-if n >= settings.summary_trigger_messages:
-    await r.set(keys.since_sum_key(conversation_id), 0)
-    await r.xadd(settings.summarize_stream, {"conversation_id": conversation_id})
+if inserted:                                                 # только при реальной вставке (не на ретрае)
+    n = await r.incrby(keys.since_sum_key(conversation_id), 2)   # +user +assistant
+    await r.expire(keys.since_sum_key(conversation_id), settings.conv_counter_ttl_seconds)
+    if n >= settings.summary_trigger_messages:
+        await r.set(keys.since_sum_key(conversation_id), 0, ex=settings.conv_counter_ttl_seconds)
+        await r.xadd(settings.summarize_stream, {"conversation_id": conversation_id})
+    # АВТО-НАЗВАНИЕ: один раз на диалог (NX-маркер title:enq дедупит)
+    if await r.set(keys.title_enq(conversation_id), "1", nx=True, ex=settings.title_enqueue_ttl_seconds):
+        await r.xadd(settings.summarize_stream, {"conversation_id": conversation_id, "task": "title"})
+# порядок: помечаем seq применённым строго после успеха (до снятия замка)
+if seq: await _mark_applied(r, conversation_id, seq)
 ```
 
-Считаем новые сообщения (за ход +2). Накопилось достаточно → ставим задачу в **отдельную** очередь и сбрасываем счётчик. Саму свёртку делает summarizer, **не блокируя** ответ пользователю. См. [06. Суммаризация](06-summarization.md).
+Считаем новые сообщения (за ход +2, только на реальной вставке — чтобы ретрай не накрутил счётчик). Накопилось достаточно → ставим задачу в **отдельную** очередь и сбрасываем счётчик. Первый ответ ассистента заодно ставит задачу авто-названия (`task: "title"`). Саму свёртку и заголовок делает summarizer, **не блокируя** ответ пользователю. См. [06. Суммаризация](06-summarization.md).
 
 ## Кто пишет что: сводка переносов
 
@@ -138,5 +165,6 @@ if n >= settings.summary_trigger_messages:
 |---|---|---|
 | `conv_lock_ttl_seconds` | 300 c (+heartbeat) | TTL замка диалога; продлевается во время генерации |
 | `summary_trigger_messages` | 20 | порог запуска суммаризации |
-| `gen_ttl_seconds` | 300 | жизнь ленты генерации |
-| `CONSUMER_NAME` | `worker-1` | имя консьюмера (в проде — уникальное) |
+| `gen_ttl_seconds` / `gen_active_ttl_seconds` | 300 / 900 | жизнь ленты генерации после `end` / во время |
+| `reclaim_min_idle_ms` | 300000 | порог реклейма PEL (валидатор: `>= conv_lock_ttl*1000`) |
+| `CONSUMER_NAME` | `{hostname}-{pid}-{rnd}` | имя консьюмера — уникально на процесс (для PEL/`XAUTOCLAIM`) |

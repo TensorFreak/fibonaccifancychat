@@ -118,7 +118,7 @@ async def stream_completion(messages, max_tokens=None):
                "max_tokens": max_tokens or settings.max_response_tokens}
 ```
 
-Без `max_tokens` длина ответа неограничена. Теперь: генерация ответа — `max_response_tokens` (1024), суммаризация — `summary_max_tokens` (512, пробрасывается явно).
+Без `max_tokens` длина ответа неограничена. Теперь: генерация ответа — `max_response_tokens` (4096), суммаризация — `summary_max_tokens` (2000, пробрасывается явно).
 
 ## Правка 3 — потолок на резюме
 
@@ -177,9 +177,10 @@ if not selected and window:
 
 Основной рычаг — три числа под вашу модель:
 
-- `model_context_window` — из ТТХ модели;
+- `context_window_tokens` — из ТТХ модели;
 - `max_response_tokens` — сколько максимум должен отвечать бот;
-- `prompt_token_budget` ≈ `model_context_window − max_response_tokens −` запас (10–20%).
+- `prompt_token_budget` ≈ `context_window_tokens − max_response_tokens −` запас (10–20%),
+  либо `0` = авто (валидатор сам выведет потолок).
 
 Меняются через переменные окружения / `.env` (см. [`app/config.py`](../app/config.py)).
 

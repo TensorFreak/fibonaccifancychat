@@ -10,9 +10,11 @@
 
 ### `users`
 ```sql
-id UUID PK, created_at TIMESTAMPTZ
+id UUID PK, email TEXT UNIQUE, password_hash TEXT, created_at TIMESTAMPTZ
 ```
-Пользователи. Минимально.
+Пользователи. `email` (уникален, храним в lower) и `password_hash` (bcrypt) — для
+веб-регистрации/входа; оба NULL, если строка создана не через форму (напр. `ensure_conversation`
+при подключении по ws создаёт запись только с `id`). См. [11. Веб и деплой](11-web-and-deploy.md).
 
 ### `conversations`
 ```sql
@@ -47,12 +49,17 @@ idx_messages_dedup   ON messages (message_id, role) WHERE message_id IS NOT NULL
 
 ## Слой доступа: `app/db.py`
 
-Async через `asyncpg`, пул соединений (`min_size=1, max_size=10`).
+Async через `asyncpg`, пул соединений (`min_size=1, max_size=10`) с таймаутами запросов
+(`command_timeout` + серверный `statement_timeout`) — зависший запрос не держит соединение
+вечно (см. [10. Харденинг](10-hardening.md), R3-M3).
 
 | Функция | Назначение |
 |---|---|
+| `create_user(email, password_hash)` | создать пользователя (веб-регистрация), → id |
+| `get_user_by_email(email)` | найти пользователя по email (вход) → `{id, password_hash}` |
 | `ensure_conversation(conv, user_id)` | создать `users`/`conversations` и проверить владение (→ bool) |
 | `insert_message(conv, role, content, message_id)` | вставка сообщения, идемпотентная (`ON CONFLICT`), → bool |
+| `assistant_exists(conv, message_id)` | есть ли уже ответ ассистента на этот `message_id` (идемпотентность хода, [10](10-hardening.md) R3-M2) |
 | `load_recent_messages(conv, limit)` | последние N (по `id`) в хронологии — регидратация окна (с `mid`) |
 | `load_messages_page(conv, limit, before_id)` | keyset-страница сообщений — **message_cursor** ([14](14-pagination.md)) |
 | `list_conversations_page(user, limit, before)` | keyset-страница списка диалогов (с `title`) — **chat_cursor** ([14](14-pagination.md)) |
@@ -72,22 +79,31 @@ Async через `asyncpg`, пул соединений (`min_size=1, max_size=1
 | Ключ | Тип | Содержимое | TTL | Документ |
 |---|---|---|---|---|
 | `chat:inbound` | Stream | входящие задачи | до `XACK` | [03](03-inbound-queue.md) |
-| `chat:summarize` | Stream | задачи суммаризации | до `XACK` | [06](06-summarization.md) |
+| `chat:summarize` | Stream | задачи суммаризации / авто-название | до `XACK` | [06](06-summarization.md) |
+| `chat:inbound:dead`, `chat:summarize:dead` | Stream | dead-letter «отравленных» задач | — (разбор вручную) | [10](10-hardening.md) R5-4 |
 | `ctx:{id}` | List | горячее окно последних сообщений | 1800 c | [05](05-hot-context.md) |
 | `sum:{id}` | String | кэш текущего резюме | 1800 c | [06](06-summarization.md) |
-| `since_sum:{id}` | String (счётчик) | сколько сообщений с последней свёртки | — | [06](06-summarization.md) |
+| `since_sum:{id}` | String (счётчик) | сколько сообщений с последней свёртки | 86400 c | [06](06-summarization.md) |
 | `conv:{id}` | Pub/Sub | control-события (`gen_start`, `user_message`) | не хранится | [02](02-websocket-api.md) |
-| `gen:{id}:{mid}` | Stream | токены одной генерации | 300 c после `end` | [07](07-resumable-streams.md) |
+| `gen:{id}:{mid}` | Stream | токены одной генерации | 300 c после `end` (900 c во время) | [07](07-resumable-streams.md) |
 | `active_gen:{id}` | String | id идущей сейчас генерации | 300 c | [07](07-resumable-streams.md) |
 | `lock:conv:{id}` | String | замок диалога (сериализация) | 300 c + heartbeat | [04](04-llm-worker.md) |
-| `lock:sum:{id}` | String | замок суммаризации | 120 c | [06](06-summarization.md) |
-| `seq:conv:{id}` | String (счётчик) | монотонный номер сообщения (FIFO) | — | [10](10-hardening.md) |
-| `applied:conv:{id}` | String | номер последнего применённого сообщения | — | [10](10-hardening.md) |
+| `lock:sum:{id}` | String | замок суммаризации | 300 c + heartbeat | [06](06-summarization.md) |
+| `seq:conv:{id}` | String (счётчик) | монотонный номер сообщения (FIFO) | 86400 c | [10](10-hardening.md) |
+| `applied:conv:{id}` | String | номер последнего применённого сообщения | 86400 c | [10](10-hardening.md) |
+| `title:enq:{id}` | String (маркер) | «авто-название уже запрошено» (дедуп) | 86400 c | [06](06-summarization.md) |
+| `rl:ws:{user}:{window}` | String (счётчик) | рейтлимит ws-сообщений per-user | окно (10 c) | [10](10-hardening.md) H2 |
 
-Идемпотентность вставок обеспечивается не Redis-ключом, а частичным уникальным индексом
-`(message_id, role)` в Postgres (`INSERT … ON CONFLICT`) — см. [10](10-hardening.md), C3.
+TTL счётчиков `since_sum`/`seq:conv`/`applied:conv` (`conv_counter_ttl_seconds`, сутки)
+продлевается на активности и истекает синхронно — «остывший» диалог начинает счёт заново,
+это безопасно ([10](10-hardening.md), R3-M1). Идемпотентность вставок обеспечивается не
+Redis-ключом, а частичным уникальным индексом `(message_id, role)` в Postgres — см.
+[10](10-hardening.md), C3.
 
-Функции-конструкторы ключей в `keys.py`: `ctx_key`, `conv_channel`, `conv_lock`, `sum_key`, `since_sum_key`, `gen_stream`, `active_gen`, `conv_seq`, `conv_applied`. Стримы/группы — в `config.py`.
+Функции-конструкторы ключей в `keys.py`: `ctx_key`, `conv_channel`, `conv_lock`, `sum_key`,
+`since_sum_key`, `gen_stream`, `active_gen`, `title_enq`, `conv_seq`, `ws_rate`, `conv_applied`.
+Замок суммаризации (`lock:sum:{id}`) и dead-letter-стримы (`<stream>:dead`) собираются по месту.
+Стримы/группы — в `config.py`.
 
 ## Что где живёт: сводка по данным
 
