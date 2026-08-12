@@ -1,5 +1,7 @@
 """Централизованная конфигурация. Читается из переменных окружения / .env.
 Один и тот же объект settings импортируют И api, И воркеры — это общий код."""
+from typing import ClassVar
+
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
@@ -78,8 +80,12 @@ class Settings(BaseSettings):
     # --- КОНТРОЛЬ ДЛИНЫ (бюджет токенов) ---
     # Полное контекстное окно модели. Теперь это НЕ справка, а реальный потолок:
     # валидатор ниже гарантирует prompt_token_budget + max_response_tokens + запас
-    # <= context_window_tokens. Поставьте под свою модель.
-    context_window_tokens: int = 256000
+    # <= context_window_tokens. ОБЯЗАТЕЛЬНО поставьте под свою модель.
+    # ДЕФОЛТ согласован с llm_model по умолчанию (gpt-4o-mini = 128k). Валидатор ниже
+    # (H1-review) ГРОМКО предупредит, если это значение подозрительно велико для
+    # известной модели, — иначе «авто»-бюджет собрал бы промпт под окно, которого у
+    # модели нет, и КАЖДЫЙ длинный диалог падал бы с context_length_exceeded.
+    context_window_tokens: int = 128000
     # Резерв под ответ ассистента -> уходит в max_tokens запроса к LLM.
     max_response_tokens: int = 4096
     # Потолок на ВЕСЬ промпт запроса (summary + горячее окно). Горячее окно
@@ -278,6 +284,38 @@ class Settings(BaseSettings):
         ceiling = max(ceiling, 512)   # деградация, но не абсурд
         if self.prompt_token_budget <= 0 or self.prompt_token_budget > ceiling:
             self.prompt_token_budget = ceiling
+        return self
+
+    # Известные контекстные окна распространённых моделей — для фейл-фаст проверки
+    # согласованности context_window_tokens с llm_model (H1-review). Матчим по префиксу.
+    # Неизвестная модель (свой прокси/локальная) проверку пропускает — оператор сам знает
+    # её окно. Список намеренно короткий: только чтобы поймать очевидный рассинхрон.
+    _KNOWN_MODEL_WINDOWS: ClassVar[dict[str, int]] = {
+        "gpt-4o-mini": 128000, "gpt-4o": 128000, "gpt-4.1": 1047576,
+        "gpt-4-turbo": 128000, "gpt-4": 8192, "gpt-3.5-turbo": 16385,
+        "o1": 200000, "o3": 200000, "o4-mini": 200000,
+    }
+
+    @model_validator(mode="after")
+    def _guard_context_window_matches_model(self):
+        """Фейл-фаст против рассинхрона context_window_tokens и llm_model (H1-review).
+
+        prompt_token_budget в режиме «авто» занимает почти всё context_window_tokens.
+        Если оно БОЛЬШЕ реального окна модели, «авто»-бюджет соберёт промпт под окно,
+        которого у модели НЕТ, и каждый длинный диалог упрётся в context_length_exceeded —
+        то есть заявленная гарантия #6 (не превышать контекст) молча ломается. Матчим
+        llm_model по самому длинному известному префиксу; неизвестную модель пропускаем."""
+        model = (self.llm_model or "").lower()
+        match = max((p for p in self._KNOWN_MODEL_WINDOWS if model.startswith(p)),
+                    key=len, default=None)
+        if match and self.context_window_tokens > self._KNOWN_MODEL_WINDOWS[match]:
+            raise ValueError(
+                f"context_window_tokens ({self.context_window_tokens}) exceeds the known "
+                f"context window of llm_model={self.llm_model} "
+                f"({self._KNOWN_MODEL_WINDOWS[match]}). The auto prompt budget would build "
+                f"prompts larger than the model accepts and every long conversation would "
+                f"fail with context_length_exceeded. Set CONTEXT_WINDOW_TOKENS to your "
+                f"model's real window.")
         return self
 
     @model_validator(mode="after")

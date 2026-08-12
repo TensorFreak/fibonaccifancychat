@@ -239,6 +239,18 @@ async function loadOlder(){
 $("log").addEventListener("scroll", ()=>{ if($("log").scrollTop < 40) loadOlder(); });
 
 // ======== ВЕБСОКЕТ ========
+// РЕКОННЕКТ = РЕСИНК из источника истины (M1-review), а не только переигрыш событий.
+// За время обрыва лента токенов gen:{} могла протухнуть раньше ленты событий
+// (gen_ttl < events_ttl), и переигранный gen_start указывал бы на уже пустую ленту —
+// «пишет…»-бабл завис бы навсегда. Перечитываем снапшот истории из Postgres (там уже
+// лежит готовый ответ), сбрасывая lastEventId в свежий events_cursor, и лишь затем
+// тейлим новые события и активную генерацию — та же последовательность, что при первом
+// открытии чата (loadHistory -> connect), поэтому дыр/дублей не возникает.
+async function reconnect(id){
+  if(activeId !== id) return;      // юзер уже переключился в другой чат — не мешаем
+  await loadHistory(id);
+  if(activeId === id) connect(id);
+}
 function connect(id){
   if(ws){ ws.onclose = null; ws.close(); }
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -250,7 +262,7 @@ function connect(id){
   ws.onopen  = () => { $("status").textContent="онлайн"; $("status").className="on"; };
   ws.onclose = () => {
     $("status").textContent="оффлайн"; $("status").className="off";
-    setTimeout(()=>{ if(activeId===id) connect(id); }, 1500);   // авто-реконнект
+    setTimeout(()=>{ reconnect(id); }, 1500);   // авто-реконнект с ресинком (M1-review)
   };
   ws.onmessage = (ev) => {
     const e = JSON.parse(ev.data);

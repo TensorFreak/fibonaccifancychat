@@ -157,11 +157,18 @@ async def build_prompt(r, conversation_id: str) -> list[dict]:
 async def _mark_applied(r, conversation_id: str, applied_value: int) -> None:
     """Отметить applied и КОГЕРЕНТНО продлить TTL счётчиков порядка (M1).
 
-    Ставим applied и seq одним TTL в один момент -> они истекают вместе. Важно, что seq
-    продлевается воркером НЕ РАНЬШЕ applied (здесь — одновременно), а api при INCR может
-    лишь продлить seq дальше. Значит seq никогда не протухнет раньше applied, и «остывший»
-    диалог не окажется в состоянии applied>seq (что дало бы ложный дроп seq<=applied на
-    первом же новом сообщении). После простоя оба протухают вместе -> счёт с нуля, безопасно."""
+    Ставим applied и seq одним TTL в один момент -> при простое диалога оба протухают
+    примерно вместе, и «остывший» диалог начинает счёт с нуля (seq/applied — чисто
+    redis-токены порядка, не связанные с id сообщений Postgres) — это безопасно.
+
+    ОГОВОРКА (L1-review): api при приёме делает INCR seq + EXPIRE seq (см. _ENQUEUE_LUA),
+    т.е. продлевает TTL seq НЕЗАВИСИМО от applied. Поэтому «seq никогда не протухнет раньше
+    applied» — НЕ абсолют: при потоке приёма БЕЗ единой успешной обработки дольше
+    conv_counter_ttl (диалог, где КАЖДЫЙ ход падает ~сутки) applied может протухнуть под
+    живущим seq. Тогда applied сбросится в 0 при живом seq=N -> гейт увидит мнимый разрыв
+    1..N-1 и на первом же новом сообщении подождёт order_gap_timeout, после чего перешагнёт
+    (сами 1..N-1 уже в Postgres — потери данных нет, лишь разовая заморозка). Практически
+    недостижимо (нужны сутки сплошных падений), но инвариант именно такой, а не «железный»."""
     ttl = settings.conv_counter_ttl_seconds
     await r.set(keys.conv_applied(conversation_id), applied_value, ex=ttl)
     await r.expire(keys.conv_seq(conversation_id), ttl)
@@ -396,6 +403,27 @@ def _dispatch(r, msg_id, fields, inflight: set) -> None:
     t.add_done_callback(inflight.discard)
 
 
+async def _advance_gate_after_drop(r, fields: dict) -> None:
+    """Сдвинуть гейт порядка после ДЕДЛЕТТЕРА входящего сообщения (H3-review).
+
+    dead_letter снимает «отравленную» задачу с очереди, но НЕ трогает applied. Без этого
+    сдвига преемник (seq+1) увидит разрыв и зависнет на order_gap_timeout_ms (до 15 мин),
+    хотя предшественник уже осознанно выброшен, а не «в пути». Отравленная задача копит
+    доставки, ТОЛЬКО пройдя гейт (seq == applied+1) и упав в самой обработке, — значит на
+    момент дедлеттера seq является головой очереди диалога, и сдвиг applied до seq безопасен
+    (никакой живой предшественник его не обгоняет — все преемники стоят за ним). Двигаем лишь
+    вперёд (seq > applied), чтобы не откатить уже применённое."""
+    seq = int(fields.get("seq", 0) or 0)
+    conversation_id = fields.get("conversation_id")
+    if not seq or not conversation_id:
+        return
+    applied = int(await r.get(keys.conv_applied(conversation_id)) or 0)
+    if seq > applied:
+        await _mark_applied(r, conversation_id, seq)
+        log.warning("[order][DROP] conv=%s: dead-lettered seq=%d — applied advanced to "
+                    "unblock successors (was %d)", conversation_id, seq, applied)
+
+
 async def reclaim_stale(r, inflight: set):
     """Забрать у «мёртвых» воркеров задачи, висящие в PEL дольше reclaim_min_idle_ms,
     и обработать их. Без этого сообщение, у которого воркер умер между чтением и
@@ -424,6 +452,9 @@ async def reclaim_stale(r, inflight: set):
                                  msg_id) > settings.max_deliveries:
             await dead_letter(r, settings.inbound_stream, settings.consumer_group,
                               msg_id, fields, settings.dead_letter_maxlen)
+            # СДВИГ ГЕЙТА (H3-review): иначе преемник этого seq зависнет на
+            # order_gap_timeout_ms, ожидая уже осознанно выброшенное сообщение.
+            await _advance_gate_after_drop(r, fields)
             continue
         _dispatch(r, msg_id, fields, inflight)
 

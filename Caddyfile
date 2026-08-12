@@ -6,5 +6,17 @@
 # reverse_proxy прозрачно проксирует и обычные запросы, и WebSocket (Upgrade),
 # и проставляет X-Forwarded-Proto/For, которым доверяет uvicorn (--forwarded-allow-ips).
 {$SITE_ADDRESS} {
+	# Заголовки безопасности (L5-review). Namely: HSTS (браузер ходит только по https —
+	# действует, когда SITE_ADDRESS=домен с TLS; по http :80 браузер его игнорирует, вреда
+	# нет), запрет MIME-sniffing и встраивания в чужой iframe (кликджекинг), скромный
+	# referrer. CSP НЕ ставим намеренно: страницы используют inline-скрипты, строгий
+	# script-src их сломал бы — при желании добавьте отдельно с nonce/хешами.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
 	reverse_proxy api:8000
 }

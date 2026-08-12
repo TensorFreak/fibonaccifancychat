@@ -115,9 +115,13 @@ def _norm_credentials(body: dict, min_len: int = 0) -> tuple[str, str]:
 async def register(request: Request, body: dict = Body(...)):
     await _rate_limit_auth(request, "register")            # #3: режем флуд/брутфорс
     email, password = _norm_credentials(body, min_len=6)   # политика длины — при регистрации
-    if await db.get_user_by_email(email):
+    if await db.get_user_by_email(email):                  # быстрый путь (без bcrypt)
         raise HTTPException(status_code=409, detail="email already registered")
+    # create_user атомарен по email (ON CONFLICT): закрывает гонку двух одновременных
+    # регистраций одного email, которая раньше давала 500 вместо 409 (M3-review).
     user_id = await db.create_user(email, await auth.hash_password(password))
+    if user_id is None:
+        raise HTTPException(status_code=409, detail="email already registered")
     return {"token": auth.make_token(user_id), "user_id": user_id, "email": email}
 
 
@@ -563,4 +567,16 @@ async def ws_endpoint(ws: WebSocket, conversation_id: str):
 
 @app.get("/healthz")
 async def healthz():
+    """Живость С ПРОВЕРКОЙ ЗАВИСИМОСТЕЙ (L3-review): пингуем Redis и Postgres, а не
+    отдаём безусловный ok. Иначе инстанс с мёртвым Redis/PG выглядел бы «здоровым», и
+    балансировщик слал бы на него трафик. Любой сбой -> 503 (снять из ротации)."""
+    r = get_redis()
+    try:
+        await r.ping()
+        pool = await db.get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("SELECT 1")
+    except Exception as e:
+        log.warning("healthz dependency check failed: %r", e)
+        raise HTTPException(status_code=503, detail="unhealthy")
     return {"ok": True}

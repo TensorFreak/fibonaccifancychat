@@ -3,6 +3,10 @@
 services:
   postgres:
     image: postgres:16
+    # Самолечение: контейнер поднимется заново после краха/перезагрузки хоста (H2-review).
+    # Без restart-политики упавший процесс (OOM, паника при старте после моргания зависимостей)
+    # оставался бы лежать — прямой провал доступности для 24/7-сервиса.
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-app}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
@@ -24,6 +28,7 @@ services:
 
   redis:
     image: redis:7
+    restart: unless-stopped     # самолечение после краха/перезагрузки (H2-review)
     # ПЕРСИСТЕНТНОСТЬ (C2): Redis здесь — durable-очередь принятых сообщений (chat:inbound)
     # и источник истины порядка (seq/applied), поэтому его нельзя держать в памяти. AOF с
     # fsync раз в секунду + том переживают рестарт/пересоздание контейнера. Без этого
@@ -49,6 +54,7 @@ services:
   # тогда страница на https:// автоматически откроет wss:// (см. chat.html).
   api:
     build: .
+    restart: unless-stopped     # самолечение после краха/перезагрузки (H2-review)
     # --proxy-headers + --forwarded-allow-ips: доверяем X-Forwarded-* ТОЛЬКО от reverse-proxy
     # (H3). Раньше стояло "*" — любой клиент мог подделать scheme/IP. Теперь api слушает
     # только во внутренней сети (порт наружу не публикуется), а X-Forwarded принимаем от
@@ -71,6 +77,7 @@ services:
   # ходили бы по plaintext (тем более что ws-токен в URL).
   caddy:
     image: caddy:2
+    restart: unless-stopped     # самолечение после краха/перезагрузки (H2-review)
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:-:80}
     ports: ["80:80", "443:443"]
@@ -85,6 +92,7 @@ services:
   # Исполнитель №2: LLM-воркер. Consumer group, ходит к модели, пишет в Postgres.
   worker:
     build: .
+    restart: unless-stopped     # самолечение после краха/перезагрузки (H2-review)
     command: python -m app.workers.llm_worker
     env_file: .env
     depends_on:
@@ -98,6 +106,7 @@ services:
   # Сворачивает старую часть диалога в summary, не мешая горячему пути.
   summarizer:
     build: .
+    restart: unless-stopped     # самолечение после краха/перезагрузки (H2-review)
     command: python -m app.workers.summarizer
     env_file: .env
     depends_on:

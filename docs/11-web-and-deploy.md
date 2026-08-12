@@ -16,12 +16,13 @@
 
 | Метод | Путь | Назначение |
 |---|---|---|
-| POST | `/api/register` | `{email, password}` → создать юзера, вернуть JWT |
+| POST | `/api/register` | `{email, password}` → создать юзера, вернуть JWT; занятый email → **409** (атомарно `ON CONFLICT`, M3-review) |
 | POST | `/api/login` | `{email, password}` → JWT |
 | GET | `/api/conversations` | список диалогов пользователя |
 | POST | `/api/conversations` | создать диалог |
 | GET | `/api/conversations/{id}/messages` | история (только своя) |
 | WS | `/ws/{id}?token=…` | чат (токен — JWT) |
+| GET | `/healthz` | живость **с пингом Redis+Postgres**; 503 при мёртвой зависимости (L3-review) |
 
 **Аутентификация:** пароль хранится bcrypt-хешем ([`auth.hash_password`](../app/auth.py)),
 после входа выдаётся JWT (HS256, `sub=user_id`, TTL 7 дней). Его же использует вебсокет
@@ -43,7 +44,9 @@ email нет.
 
 Всё уже описано в [`docker-compose.yml`](../docker-compose.yml): postgres, redis, api,
 worker, summarizer и `caddy` (вход + TLS). Наружу открыт только `caddy` (80/443); `api`
-и `redis` доступны лишь во внутренней сети compose.
+и `redis` доступны лишь во внутренней сети compose. Все долгоживущие сервисы имеют
+`restart: unless-stopped` — поднимаются заново после краха/ребута (H2-review); `caddy` также
+проставляет заголовки безопасности (HSTS и др., см. [`Caddyfile`](../Caddyfile), L5-review).
 
 1. Скопировать env и задать секреты:
    ```bash

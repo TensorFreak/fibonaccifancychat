@@ -34,16 +34,23 @@ def _uid(value: str) -> uuid.UUID:
 
 # ---------- Пользователи (веб-регистрация) ----------
 
-async def create_user(email: str, password_hash: str) -> str:
-    """Создать пользователя, вернуть его id (UUID-строку)."""
+async def create_user(email: str, password_hash: str) -> str | None:
+    """Создать пользователя, вернуть его id (UUID-строку) или None, если email уже занят.
+
+    ON CONFLICT (email) DO NOTHING делает вставку АТОМАРНОЙ относительно гонки (M3-review):
+    прежде register делал check-then-insert (get_user_by_email -> INSERT), и два
+    одновременных сива с одним email оба проходили проверку, а второй INSERT падал на
+    UNIQUE -> клиент получал 500 вместо 409. Теперь дубль -> RETURNING пустой -> None, и
+    вызывающий отдаёт корректный 409."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """INSERT INTO users (email, password_hash) VALUES ($1, $2)
+               ON CONFLICT (email) DO NOTHING
                RETURNING id""",
             email, password_hash,
         )
-    return str(row["id"])
+    return str(row["id"]) if row else None
 
 
 async def get_user_by_email(email: str) -> dict | None:
