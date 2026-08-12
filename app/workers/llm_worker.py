@@ -25,7 +25,11 @@ from ..redis_client import get_redis
 from ..migrate import migrate
 from .. import keys, db, tokens
 from ..locks import release_lock, heartbeat_lock
+from ..deadletter import times_delivered, dead_letter
+from ..log import setup_logging, get_logger
 from ..llm.client import stream_completion
+
+log = get_logger("chat.llm_worker")
 
 # Уникальное имя консьюмера на процесс: hostname+pid+rnd. Иначе при масштабировании
 # все реплики выглядят как один консьюмер, и PEL/XAUTOCLAIM работают некорректно.
@@ -181,9 +185,9 @@ async def _order_gate(r, conversation_id: str, seq: int, fields: dict) -> bool:
             # отслеживать в метриках/алертах и при частых срабатываниях поднять
             # order_gap_timeout_ms или разгрузить очередь.
             await _mark_applied(r, conversation_id, seq - 1)   # + продлить TTL (M1)
-            print(f"[order][LOSS] conv={conversation_id}: gap timeout after "
-                  f"{settings.order_gap_timeout_ms}ms, dropping seq {applied + 1}..{seq - 1}, "
-                  f"applying seq={seq}")
+            log.warning("[order][LOSS] conv=%s: gap timeout after %dms, dropping "
+                        "seq %d..%d, applying seq=%d", conversation_id,
+                        settings.order_gap_timeout_ms, applied + 1, seq - 1, seq)
             return True
         if not gate_since:
             fields = {**fields, "gate_since": str(now_ms)}   # засекаем первое ожидание
@@ -276,10 +280,25 @@ async def process(r, fields: dict):
             await r.expire(gen_key, settings.gen_ttl_seconds)
             await r.delete(keys.active_gen(conversation_id))
             raise                                               # -> не ackать, ретрай
-        await r.xadd(gen_key, {"t": "end"})
+        answer = "".join(parts)
+        empty = not answer.strip()
+        # Завершаем ленту: с пометкой ошибки, если ответ ПУСТОЙ (все дельты пустые или
+        # ошибка в теле ответа со статусом 200) — иначе клиент увидел бы финализированный
+        # пустой бабл без признака проблемы.
+        await r.xadd(gen_key, {"t": "end", "error": "1"} if empty else {"t": "end"})
         await r.expire(gen_key, settings.gen_ttl_seconds)
         await r.delete(keys.active_gen(conversation_id))
-        answer = "".join(parts)
+
+        if empty:
+            # Пустой ответ: НЕ сохраняем пустого ассистента (не мусорим историю/контекст)
+            # и не триггерим суммаризацию/название. Ход завершён — помечаем applied и
+            # выходим (сообщение будет ack'нуто), чтобы не ретраить бесконечно. Сообщение
+            # юзера уже сохранено, клиент увидел индикатор ошибки в assistant_end.
+            log.warning("empty completion conv=%s message_id=%s — ответ не сохранён",
+                        conversation_id, message_id)
+            if seq:
+                await _mark_applied(r, conversation_id, seq)
+            return
 
         # 4) ПЕРЕНОС ->cold: ответ ассистента. message_id ассистента = inbound
         #    message_id (роль различает строки в БД) -> ретрай той же обработки не
@@ -339,11 +358,18 @@ async def reclaim_stale(r):
         if not fields:                      # запись уже удалена из стрима -> просто ack
             await r.xack(settings.inbound_stream, settings.consumer_group, msg_id)
             continue
+        # DEAD-LETTER: «отравленная» задача (падает раз за разом) — после лимита доставок
+        # снимаем её с очереди, чтобы не крутить вечно (см. deadletter.py).
+        if await times_delivered(r, settings.inbound_stream, settings.consumer_group,
+                                 msg_id) > settings.max_deliveries:
+            await dead_letter(r, settings.inbound_stream, settings.consumer_group,
+                              msg_id, fields, settings.dead_letter_maxlen)
+            continue
         try:
             await process(r, fields)
             await r.xack(settings.inbound_stream, settings.consumer_group, msg_id)
-        except Exception as e:
-            print("reclaim process error:", repr(e))
+        except Exception:
+            log.exception("reclaim process error msg_id=%s", msg_id)
 
 
 # ---------- ГЛАВНЫЙ ЦИКЛ ВОРКЕРА ----------
@@ -359,12 +385,14 @@ def _install_stop(stop: asyncio.Event):
 
 
 async def main():
+    setup_logging(settings.log_level)
     await migrate()                 # схема БД актуальна (идемпотентно)
     r = get_redis()
     await ensure_group(r)
     stop = asyncio.Event()
     _install_stop(stop)
-    print(f"llm_worker started as {CONSUMER_NAME}, listening on", settings.inbound_stream)
+    log.info("llm_worker started as %s, listening on %s",
+             CONSUMER_NAME, settings.inbound_stream)
 
     iters = 0
     while not stop.is_set():
@@ -386,12 +414,12 @@ async def main():
                     await process(r, fields)
                     # XACK — подтверждаем обработку; иначе сообщение зависнет в PEL
                     await r.xack(settings.inbound_stream, settings.consumer_group, msg_id)
-                except Exception as e:
+                except Exception:
                     # не ackаем: сообщение останется в PEL и будет переобработано
                     # (нашим reclaim_stale или другим воркером после таймаута).
-                    print("process error:", repr(e))
+                    log.exception("process error msg_id=%s", msg_id)
 
-    print("llm_worker stopping:", CONSUMER_NAME)
+    log.info("llm_worker stopping: %s", CONSUMER_NAME)
 
 
 if __name__ == "__main__":

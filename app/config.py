@@ -5,6 +5,11 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
+    # --- ЛОГИ / ЭКСПЛУАТАЦИЯ ---
+    # Уровень логов (DEBUG/INFO/WARNING/ERROR). Формат — читаемый однострочный текст в
+    # stdout (см. app/log.py): удобно смотреть на сервере `docker compose logs -f`.
+    log_level: str = "INFO"
+
     # инфраструктура
     redis_url: str = "redis://localhost:6379/0"
     postgres_dsn: str = "postgresql://app:app@localhost:5432/chat"
@@ -110,6 +115,9 @@ class Settings(BaseSettings):
 
     # Максимальная длина пароля (bcrypt режет на 72 байтах и кидает на длинных).
     password_max_chars: int = 128
+    # Максимальная длина email (RFC 5321 — адрес не длиннее 254 символов). Без лимита
+    # клиент мог бы прислать мегабайтный «email» -> лишняя нагрузка/хранение.
+    email_max_chars: int = 254
 
     # --- ВЕБ / JWT ---
     # Секрет подписи JWT. В ПРОДЕ ОБЯЗАТЕЛЬНО задать своё длинное случайное значение.
@@ -136,6 +144,12 @@ class Settings(BaseSettings):
     reclaim_min_idle_ms: int = 300000
     # Как часто (раз в N итераций основного цикла) запускать реклейм PEL.
     reclaim_every_iters: int = 20
+
+    # Dead-letter: после скольких доставок постоянно падающая («отравленная») задача
+    # переносится в поток `<stream>:dead` и подтверждается — иначе она крутилась бы в
+    # PEL вечно, переобрабатываясь reclaim'ом. Разбирать: `XRANGE <stream>:dead - +`.
+    max_deliveries: int = 5
+    dead_letter_maxlen: int = 10000
 
     # Приблизительный потолок длины стримов (XADD ... MAXLEN ~). Без него стрим
     # растёт БЕЗ ГРАНИЦ (XACK убирает из PEL, но не из стрима) -> Redis OOM.

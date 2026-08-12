@@ -15,6 +15,9 @@ from pathlib import Path
 import asyncpg
 
 from .config import settings
+from .log import get_logger
+
+log = get_logger("chat.migrate")
 
 _MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 # Произвольный фиксированный ключ, чтобы сериализовать мигрирующие процессы.
@@ -58,10 +61,10 @@ async def migrate() -> list[str]:
                     await conn.execute(
                         "INSERT INTO schema_migrations (version) VALUES ($1)", version)
                 applied_now.append(version)
-                print(f"[migrate] applied {version}")
+                log.info("applied %s", version)
 
-            print("[migrate] up to date" if not applied_now
-                  else f"[migrate] {len(applied_now)} migration(s) applied")
+            log.info("up to date" if not applied_now
+                     else f"{len(applied_now)} migration(s) applied")
         finally:
             await conn.execute("SELECT pg_advisory_unlock($1)", _ADVISORY_LOCK_KEY)
     finally:
@@ -70,4 +73,6 @@ async def migrate() -> list[str]:
 
 
 if __name__ == "__main__":
+    from .log import setup_logging
+    setup_logging(settings.log_level)     # standalone-запуск: тоже читаемые логи
     asyncio.run(migrate())

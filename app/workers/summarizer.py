@@ -22,7 +22,11 @@ from ..redis_client import get_redis
 from ..migrate import migrate
 from .. import keys, db, tokens
 from ..locks import release_lock, heartbeat_lock
+from ..deadletter import times_delivered, dead_letter
+from ..log import setup_logging, get_logger
 from ..llm.client import complete
+
+log = get_logger("chat.summarizer")
 
 # Уникальное имя консьюмера на процесс (см. пояснение в llm_worker).
 CONSUMER_NAME = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
@@ -161,11 +165,17 @@ async def reclaim_stale(r):
         if not fields:
             await r.xack(settings.summarize_stream, settings.summarize_group, msg_id)
             continue
+        # DEAD-LETTER: постоянно падающую задачу снимаем с очереди после лимита доставок.
+        if await times_delivered(r, settings.summarize_stream, settings.summarize_group,
+                                 msg_id) > settings.max_deliveries:
+            await dead_letter(r, settings.summarize_stream, settings.summarize_group,
+                              msg_id, fields, settings.dead_letter_maxlen)
+            continue
         try:
             await handle(r, fields)
             await r.xack(settings.summarize_stream, settings.summarize_group, msg_id)
-        except Exception as e:
-            print("summarize reclaim error:", repr(e))
+        except Exception:
+            log.exception("summarize reclaim error msg_id=%s", msg_id)
 
 
 def _install_stop(stop: asyncio.Event):
@@ -179,12 +189,14 @@ def _install_stop(stop: asyncio.Event):
 
 
 async def main():
+    setup_logging(settings.log_level)
     await migrate()                 # схема БД актуальна (идемпотентно)
     r = get_redis()
     await ensure_group(r)
     stop = asyncio.Event()
     _install_stop(stop)
-    print(f"summarizer started as {CONSUMER_NAME}, listening on", settings.summarize_stream)
+    log.info("summarizer started as %s, listening on %s",
+             CONSUMER_NAME, settings.summarize_stream)
 
     iters = 0
     while not stop.is_set():
@@ -203,10 +215,10 @@ async def main():
                     await handle(r, fields)
                     await r.xack(settings.summarize_stream,
                                  settings.summarize_group, msg_id)
-                except Exception as e:
-                    print("summarize error:", repr(e))
+                except Exception:
+                    log.exception("summarize error msg_id=%s", msg_id)
 
-    print("summarizer stopping:", CONSUMER_NAME)
+    log.info("summarizer stopping: %s", CONSUMER_NAME)
 
 
 if __name__ == "__main__":

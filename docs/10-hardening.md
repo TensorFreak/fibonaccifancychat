@@ -370,6 +370,49 @@ heartbeat'ом — тем же owner-aware примитивом, что и в ll
 Проверка: валидатор отвергает `heartbeat >= summarize_lock_ttl`, дефолты проходят; общий
 `heartbeat_lock` компилируется и вызывается из обоих воркеров.
 
+## R5. Прод-ревью, проход 5 (2026-08-12): LOW-фиксы + читаемые логи
+
+### R5-1 (LOW). Моргание Redis больше не роняет вебсокет
+**Было:** любой транзиентный сбой Redis во входном цикле ws (рейтлимит / `INCR seq` / `XADD`)
+пробрасывался из цикла и закрывал сокет — моргание Redis отключило бы ВСЕ активные сокеты.
+**Стало:** обращения к Redis для приёма сообщения обёрнуты в try/except
+([`ws_endpoint`](../app/api/main.py)): `WebSocketDisconnect` пробрасываем (это уже обрыв
+сокета), прочее логируем и шлём клиенту `{"type":"error","error":"server_busy"}`, сокет
+живёт. Возможный расход `seq` без `XADD` самозалечивает FIFO-гейт по `order_gap_timeout`.
+
+### R5-2 (LOW). Пустой ответ модели не мусорит историю
+**Было:** пустая генерация (все дельты пустые / ошибка в теле ответа со статусом 200)
+сохранялась как пустое сообщение ассистента и финализировала бабл без признака проблемы.
+**Стало:** [`process`](../app/workers/llm_worker.py) проверяет `answer.strip()`; при пустом
+ответе лента завершается `end` с `error=1` (клиент видит индикатор), пустой ассистент НЕ
+пишется, суммаризация/название не триггерятся, `applied` двигается, ход подтверждается
+(без бесконечного ретрая). Сообщение юзера уже сохранено.
+
+### R5-3 (LOW). Лимит длины email
+**Было:** длина email не ограничивалась. **Стало:** `email_max_chars` (254, RFC 5321) в
+[`_norm_credentials`](../app/api/main.py) → 400 на слишком длинном.
+
+### R5-4 (LOW). Dead-letter для «отравленных» задач
+**Было:** задача, всегда падающая в обработке, никогда не ack'алась и вечно крутилась в
+PEL (её без конца переобрабатывал reclaim). **Стало:** [`deadletter.py`](../app/deadletter.py)
+— в `reclaim_stale` ОБОИХ воркеров перед обработкой проверяем счётчик доставок PEL
+(`times_delivered`); после `max_deliveries` задача переносится в `<stream>:dead` и ack'ается.
+Разбирать вручную: `XRANGE chat:inbound:dead - +`.
+
+### R5-5. Читаемые логи вместо `print()`
+Единый человекочитаемый однострочный формат в stdout через `logging`
+([`app/log.py`](../app/log.py)) — смотреть прямо на сервере (`docker compose logs -f`).
+Это НЕ структурный JSON под внешний сборщик, а простой текст «глазами»:
+```
+2026-08-12 14:23:01 INFO     [chat.llm_worker] llm_worker started as host-42-a1b2c3 ...
+2026-08-12 14:23:07 WARNING  [chat.api] pubsub reconnect conv=… : ConnectionError(...)
+2026-08-12 14:23:09 ERROR    [chat.llm_worker] process error msg_id=… (+ traceback)
+```
+Все `print()` в `app/` заменены на логгеры компонентов (`chat.api`, `chat.llm_worker`,
+`chat.summarizer`, `chat.locks`, `chat.deadletter`, `chat.migrate`). Уровень — `LOG_LEVEL`
+(env) / `log_level`, по умолчанию INFO; ошибки обработки логируются с трейсбеком
+(`log.exception`). `setup_logging` вызывается на старте каждого процесса.
+
 ## Новые параметры конфигурации
 
 | Параметр | Значение | Назначение |
@@ -384,6 +427,9 @@ heartbeat'ом — тем же owner-aware примитивом, что и в ll
 | `conv_counter_ttl_seconds` | 86400 | idle-TTL счётчиков `seq`/`applied`/`since_sum` (R3-M1) |
 | `pg_command_timeout` / `pg_statement_timeout_ms` | 30 / 30000 | таймауты запросов Postgres (R3-M3) |
 | `summarize_lock_ttl_seconds` | 300 | TTL замка суммаризации + heartbeat (R4-M1); валидатор требует `> lock_heartbeat` |
+| `log_level` | INFO | уровень читаемых логов в stdout (R5-5) |
+| `email_max_chars` | 254 | лимит длины email при регистрации/входе (R5-3) |
+| `max_deliveries` / `dead_letter_maxlen` | 5 / 10000 | dead-letter «отравленных» задач стрима (R5-4) |
 | `context_window_tokens` | 256000 | окно модели (переименовано с `model_context_window`) |
 | `inbound_stream_maxlen` / `summarize_stream_maxlen` | 100000 / 50000 | потолок длины стримов |
 | `conv_lock_ttl_seconds` / `lock_heartbeat_seconds` | 300 / 30 | TTL замка + период heartbeat |

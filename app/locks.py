@@ -11,6 +11,10 @@
 только СВОЙ замок (проверка владения перед EXPIRE)."""
 import asyncio
 
+from .log import get_logger
+
+log = get_logger("chat.locks")
+
 # KEYS[1] = ключ замка, ARGV[1] = ожидаемый токен владельца.
 _RELEASE_LUA = (
     "if redis.call('get', KEYS[1]) == ARGV[1] "
@@ -24,7 +28,7 @@ async def release_lock(r, key: str, token: str) -> bool:
     try:
         return bool(await r.eval(_RELEASE_LUA, 1, key, token))
     except Exception as e:                       # снятие замка не должно ронять обработку
-        print("release_lock error:", repr(e))
+        log.warning("release_lock error key=%s: %r", key, e)
         return False
 
 

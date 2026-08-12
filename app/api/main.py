@@ -32,13 +32,19 @@ from ..redis_client import get_redis
 from ..migrate import migrate
 from .. import keys, db, auth
 from ..auth import authenticate
+from ..log import setup_logging, get_logger
+
+log = get_logger("chat.api")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Читаемые логи в stdout (см. app/log.py) — до всего остального.
+    setup_logging(settings.log_level)
     # При старте применяем миграции БД (идемпотентно, под advisory-lock — безопасно
     # даже если несколько инстансов стартуют одновременно).
     await migrate()
+    log.info("api ready")
     yield
 
 
@@ -73,6 +79,8 @@ def _norm_credentials(body: dict, min_len: int = 0) -> tuple[str, str]:
     password = body.get("password") or ""
     if not email or not password:
         raise HTTPException(status_code=400, detail="email and password required")
+    if len(email) > settings.email_max_chars:
+        raise HTTPException(status_code=400, detail="email too long")
     if len(password) > settings.password_max_chars:
         raise HTTPException(status_code=400, detail="password too long")
     if min_len and len(password) < min_len:
@@ -315,7 +323,7 @@ async def ws_endpoint(ws: WebSocket, conversation_id: str):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                print("pubsub reconnect:", repr(e))
+                log.warning("pubsub reconnect conv=%s: %r", conversation_id, e)
                 try:
                     await pubsub.unsubscribe(keys.conv_channel(conversation_id))
                 except Exception:
@@ -344,29 +352,43 @@ async def ws_endpoint(ws: WebSocket, conversation_id: str):
                 await send(json.dumps({"type": "error", "error": "too_long"}))
                 continue
 
-            # РЕЙТЛИМИТ (H2): режем флуд ДО расхода seq и XADD, чтобы один клиент не
-            # заливал общий inbound-стрим и не вытеснял из него сообщения других юзеров.
-            if not await _allow_ws_message(r, user_id):
-                await send(json.dumps({"type": "error", "error": "rate_limited"}))
+            # Все обращения к Redis для приёма сообщения — под одним try: транзиентный
+            # сбой Redis НЕ должен ронять вебсокет (иначе моргание Redis отключило бы
+            # все активные сокеты разом). Сообщаем клиенту server_busy и ждём следующее.
+            # WebSocketDisconnect пробрасываем — это уже обрыв самого сокета.
+            try:
+                # РЕЙТЛИМИТ (H2): режем флуд ДО расхода seq и XADD, чтобы один клиент не
+                # заливал общий inbound-стрим и не вытеснял сообщения других юзеров.
+                if not await _allow_ws_message(r, user_id):
+                    await send(json.dumps({"type": "error", "error": "rate_limited"}))
+                    continue
+
+                # seq — монотонный номер сообщения в диалоге (FIFO-порядок в воркере).
+                # Продлеваем TTL счётчика на активности (M1): в паре с продлением в воркере
+                # (_mark_applied) это держит seq живым не меньше applied, а после простоя
+                # оба протухают вместе -> счёт с нуля, без ложных дропов.
+                seq = await r.incr(keys.conv_seq(conversation_id))
+                await r.expire(keys.conv_seq(conversation_id),
+                               settings.conv_counter_ttl_seconds)
+
+                # XADD кладёт задачу в durable-очередь и мгновенно возвращает управление.
+                # Пользователь может слать новые сообщения, не дожидаясь ответа LLM.
+                # MAXLEN ~ ограничивает рост стрима (XACK убирает из PEL, но не из стрима).
+                await r.xadd(settings.inbound_stream, {
+                    "conversation_id": conversation_id,
+                    "user_id": user_id,
+                    "message_id": str(uuid.uuid4()),
+                    "seq": str(seq),
+                    "text": text,
+                }, maxlen=settings.inbound_stream_maxlen, approximate=True)
+            except WebSocketDisconnect:
+                raise
+            except Exception as e:
+                # Redis моргнул: сокет живой, сообщение не принято. Клиент может повторить.
+                # Возможный расход seq без XADD самозалечит FIFO-гейт по order_gap_timeout.
+                log.warning("inbound redis error conv=%s: %r", conversation_id, e)
+                await send(json.dumps({"type": "error", "error": "server_busy"}))
                 continue
-
-            # seq — монотонный номер сообщения в диалоге (FIFO-порядок в воркере).
-            # Продлеваем TTL счётчика на активности (M1): в паре с продлением в воркере
-            # (_mark_applied) это держит seq живым не меньше applied, а после простоя оба
-            # протухают вместе -> счёт с нуля, без ложных дропов.
-            seq = await r.incr(keys.conv_seq(conversation_id))
-            await r.expire(keys.conv_seq(conversation_id), settings.conv_counter_ttl_seconds)
-
-            # XADD кладёт задачу в durable-очередь и мгновенно возвращает управление.
-            # Пользователь может слать новые сообщения, не дожидаясь ответа LLM.
-            # MAXLEN ~ ограничивает рост стрима (XACK убирает из PEL, но не из стрима).
-            await r.xadd(settings.inbound_stream, {
-                "conversation_id": conversation_id,
-                "user_id": user_id,
-                "message_id": str(uuid.uuid4()),
-                "seq": str(seq),
-                "text": text,
-            }, maxlen=settings.inbound_stream_maxlen, approximate=True)
     except WebSocketDisconnect:
         pass
     finally:
