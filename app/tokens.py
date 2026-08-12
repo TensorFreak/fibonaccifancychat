@@ -44,6 +44,17 @@ def _encoding(model: str):
         return None
 
 
+def warm_encoder() -> None:
+    """Прогреть энкодер tiktoken ОДИН РАЗ на старте процесса (H-2).
+
+    _encoding при первом вызове может СХОДИТЬ В СЕТЬ за BPE-рангами и синхронно
+    что-то посчитать. Если это случится посреди генерации, оно заблокирует event loop
+    воркера (и heartbeat замка). Поэтому вызываем прогрев на старте — через
+    asyncio.to_thread, — чтобы сетевой поход (если он есть) случился один раз и вне
+    горячего пути. Кэш lru_cache в _encoding сохранит результат."""
+    _encoding(settings.llm_model)
+
+
 def _approx(text: str) -> int:
     return max(1, len(text) // _CHARS_PER_TOKEN)
 

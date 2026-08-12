@@ -20,7 +20,15 @@
 > **Закрытый контур:** tiktoken при первом вызове может ходить в интернет за BPE-рангами.
 > Если энкодер получить не удалось (офлайн), модуль переходит на грубую эвристику
 > (~3 символа/токен, с запасом в бо́льшую сторону) — сервис **не падает**. Для точного
-> подсчёта положите кэш в образ и задайте `TIKTOKEN_CACHE_DIR`. См. [10](10-hardening.md), H4.
+> подсчёта кэш рангов **уже вшит в образ**: [`Dockerfile`](../Dockerfile) прекачивает
+> `o200k_base`+`cl100k_base` и задаёт `TIKTOKEN_CACHE_DIR`. См. [10](10-hardening.md), H4/R6-2.
+
+> **Неблокирующий подсчёт (R6-2):** `tiktoken` синхронный и CPU-затратный, а первый вызов
+> ещё и может сходить в сеть. Поэтому: (1) энкодер прогревается на старте воркера
+> (`tokens.warm_encoder` через `asyncio.to_thread`) — возможный сетевой поход случается
+> один раз и вне горячего пути; (2) сам подсчёт при сборке промпта и свёртке вынесен в
+> поток. tiktoken (Rust) отпускает GIL, поэтому это реально параллелится по ядрам.
+> См. [10](10-hardening.md), R6-2.
 
 | Функция | Что делает |
 |---|---|
@@ -72,11 +80,12 @@ ceiling = context_window_tokens − max_response_tokens − context_window_token
 
 Было: `[summary] + все 20 сообщений окна`. Стало: собираем по бюджету.
 
-```python
-async def build_prompt(r, conversation_id):
-    window = await load_context(r, conversation_id)
-    summary = await get_summary(r, conversation_id)
+> Ниже показана логика отбора. В коде она вынесена в чистую функцию `_assemble_prompt`,
+> которую `build_prompt` вызывает через `asyncio.to_thread` — весь `tiktoken`-подсчёт идёт
+> в потоке, не блокируя event loop (R6-2). Ввод-вывод (Redis/PG) остаётся асинхронным.
 
+```python
+def _assemble_prompt(window, summary):        # чистый CPU; вызывается через to_thread
     budget = settings.prompt_token_budget
     head = []
     if summary:

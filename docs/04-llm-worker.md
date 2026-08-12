@@ -20,18 +20,35 @@
 
 ## Главный цикл
 
+Цикл **не** ждёт каждую генерацию — он раздаёт сообщения фоновым задачам и держит их
+не больше `worker_concurrency` штук одновременно (диспетчеризация, [10](10-hardening.md),
+R6-1). Читаем из группы ровно столько, сколько свободных слотов, — чтобы не захватывать
+в свой PEL больше, чем реально ведём:
+
 ```python
 await ensure_group(r)                     # создать consumer group (идемпотентно)
-while True:
-    resp = await r.xreadgroup(group, name, {inbound: ">"}, count=1, block=5000)
+inflight: set[asyncio.Task] = set()
+concurrency = settings.worker_concurrency
+while not stop.is_set():
+    if iters % reclaim_every_iters == 0 and len(inflight) < concurrency:
+        await reclaim_stale(r, inflight)              # зависшие задачи мёртвых воркеров
+    while len(inflight) >= concurrency:               # нет слотов -> ждём завершения одной
+        await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+    available = concurrency - len(inflight)
+    resp = await r.xreadgroup(group, name, {inbound: ">"}, count=available, block=5000)
     for _stream, entries in resp:
         for msg_id, fields in entries:
-            try:
-                await process(r, fields)
-                await r.xack(inbound, group, msg_id)   # подтвердить
-            except Exception:
-                log.exception("process error msg_id=%s", msg_id)  # НЕ ackать -> PEL -> повтор
+            _dispatch(r, msg_id, fields, inflight)     # фоновая задача _process_and_ack
+# мягкая остановка: дождаться текущих генераций
+await asyncio.gather(*inflight, return_exceptions=True)
 ```
+
+Каждая фоновая задача (`_process_and_ack`) обрабатывает своё сообщение и подтверждает
+его: `XACK` при успехе; при ошибке НЕ ackает — сообщение остаётся в PEL и будет
+переобработано (`reclaim_stale` или другим воркером). Генерации **разных** диалогов
+идут параллельно (все почти всё время ждут сеть LLM); порядок и взаимоисключение
+**внутри** диалога держат seq-гейт и замок (см. Шаг 0). Мягкая остановка ждёт активные
+генерации, чтобы не рвать ответы на лету.
 
 Логи — читаемый однострочный формат в stdout (`app/log.py`); ошибки — с трейсбеком
 (`log.exception`). «Отравленную» задачу, падающую раз за разом, `reclaim_stale` после
@@ -84,7 +101,7 @@ if added:                                                            # эхо т
 prompt = await build_prompt(r, conversation_id)
 ```
 
-Промпт = `[summary как system]` + горячее окно, собранные **по токен-бюджету** (не по числу сообщений). Логика бюджета, обрезки и предохранителей — в [08. Контроль длины](08-token-budget.md).
+Промпт = `[summary как system]` + горячее окно, собранные **по токен-бюджету** (не по числу сообщений). Данные тянутся из Redis/PG асинхронно, а сам подсчёт токенов (синхронный `tiktoken`) выносится в поток через `asyncio.to_thread`, чтобы не блокировать event loop воркера и heartbeat замка ([10](10-hardening.md), R6-2). Логика бюджета, обрезки и предохранителей — в [08. Контроль длины](08-token-budget.md).
 
 ### Шаг 3 — генерация в durable-ленту
 
@@ -163,6 +180,7 @@ if seq: await _mark_applied(r, conversation_id, seq)
 
 | Параметр | Значение | Где влияет |
 |---|---|---|
+| `worker_concurrency` | 32 | сколько генераций РАЗНЫХ диалогов процесс ведёт одновременно (R6-1) |
 | `conv_lock_ttl_seconds` | 300 c (+heartbeat) | TTL замка диалога; продлевается во время генерации |
 | `summary_trigger_messages` | 20 | порог запуска суммаризации |
 | `gen_ttl_seconds` / `gen_active_ttl_seconds` | 300 / 900 | жизнь ленты генерации после `end` / во время |

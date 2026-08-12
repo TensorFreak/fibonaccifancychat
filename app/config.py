@@ -134,6 +134,14 @@ class Settings(BaseSettings):
     page_size_max: int = 100              # верхний предел limit из запроса
 
     # --- НАДЁЖНОСТЬ ОБРАБОТКИ ---
+    # Сколько генераций РАЗНЫХ диалогов один воркер ведёт ОДНОВРЕМЕННО (H-1). Генерация
+    # почти всё время ждёт сеть LLM, поэтому один asyncio-процесс спокойно мультиплексирует
+    # десятки таких ожиданий на одном ядре — не нужно плодить процессы (и множить пулы
+    # Postgres). Порядок ВНУТРИ диалога держат seq-гейт и замок диалога, поэтому
+    # параллелятся только РАЗНЫЕ диалоги. Держите с запасом ниже, чем позволяет пул
+    # Postgres (max_size) и лимиты Redis; при росте — сначала поднимите этот параметр,
+    # а не число процессов.
+    worker_concurrency: int = 32
     # Реклейм зависших задач: заберём у «мёртвого» воркера всё, что висит в PEL
     # дольше этого простоя (мс). ВАЖНО: держите заметно больше максимального времени
     # генерации ответа, иначе долгий (напр. на большом контексте) ответ,
@@ -242,6 +250,8 @@ class Settings(BaseSettings):
             raise ValueError(
                 "reclaim_min_idle_ms must be >= conv_lock_ttl_seconds*1000 "
                 "(don't reclaim a task before a dead worker's lock would expire)")
+        if self.worker_concurrency < 1:
+            raise ValueError("worker_concurrency must be >= 1")
         return self
 
     @model_validator(mode="after")

@@ -96,19 +96,19 @@ async def get_summary(r, conversation_id: str) -> str | None:
     return summary
 
 
-async def build_prompt(r, conversation_id: str) -> list[dict]:
-    """Финальный промпт = [summary как system] + горячее окно последних сообщений,
-    собранный ПО ТОКЕН-БЮДЖЕТУ (не по числу сообщений).
+def _assemble_prompt(window: list[dict], summary: str | None) -> list[dict]:
+    """ЧИСТО CPU-часть сборки промпта: подсчёт токенов через tiktoken и отбор по бюджету.
+
+    Вынесена в отдельную функцию, чтобы вызывать её через asyncio.to_thread (H-2):
+    tiktoken синхронный и CPU-затратный, а прямой вызов из event loop блокировал бы
+    весь воркер (включая heartbeat замка). tiktoken (Rust) отпускает GIL, поэтому в
+    потоке это реально параллелится по ядрам.
 
     Контроль длины:
       1) summary кладём как system-голову и вычитаем его стоимость из бюджета;
       2) окно набираем С КОНЦА (свежие сообщения важнее), пока укладываемся;
       3) аварийный предохранитель: если даже одно последнее сообщение не влезает,
-         берём его обрезанным — модель должна получить хотя бы текущий вопрос.
-    Старое, не попавшее в бюджет, не теряется: оно в Postgres и свёрнуто в summary."""
-    window = await load_context(r, conversation_id)
-    summary = await get_summary(r, conversation_id)
-
+         берём его обрезанным — модель должна получить хотя бы текущий вопрос."""
     budget = settings.prompt_token_budget
     head: list[dict] = []
     if summary:
@@ -138,6 +138,18 @@ async def build_prompt(r, conversation_id: str) -> list[dict]:
     # проекция к чистым {role, content}: во внутренних записях окна есть служебный
     # `mid` — в LLM его слать нельзя.
     return [{"role": m["role"], "content": m["content"]} for m in (head + selected)]
+
+
+async def build_prompt(r, conversation_id: str) -> list[dict]:
+    """Финальный промпт = [summary как system] + горячее окно последних сообщений,
+    собранный ПО ТОКЕН-БЮДЖЕТУ (не по числу сообщений).
+
+    Данные тянем из Redis/PG асинхронно, а сам подсчёт токенов (синхронный tiktoken)
+    выносим в поток, чтобы не блокировать event loop воркера (H-2). Старое, не попавшее
+    в бюджет, не теряется: оно в Postgres и свёрнуто в summary."""
+    window = await load_context(r, conversation_id)
+    summary = await get_summary(r, conversation_id)
+    return await asyncio.to_thread(_assemble_prompt, window, summary)
 
 
 # ---------- ОБРАБОТКА ОДНОГО ВХОДЯЩЕГО СООБЩЕНИЯ ----------
@@ -340,10 +352,35 @@ async def process(r, fields: dict):
 
 # ---------- ВОССТАНОВЛЕНИЕ ЗАВИСШИХ ЗАДАЧ (PEL) ----------
 
-async def reclaim_stale(r):
+async def _process_and_ack(r, msg_id, fields) -> None:
+    """Обработать ОДНО сообщение и подтвердить (XACK) при успехе. Запускается ОТДЕЛЬНОЙ
+    задачей (см. main), чтобы воркер вёл несколько генераций РАЗНЫХ диалогов параллельно:
+    генерация почти всё время ждёт сеть LLM, поэтому один event loop мультиплексирует их
+    дёшево (H-1). Порядок ВНУТРИ диалога держат seq-гейт и замок диалога — параллелятся
+    только разные диалоги. При ошибке НЕ ackаем: сообщение останется в PEL и будет
+    переобработано (нашим reclaim_stale или другим воркером после таймаута)."""
+    try:
+        await process(r, fields)
+        await r.xack(settings.inbound_stream, settings.consumer_group, msg_id)
+    except Exception:
+        log.exception("process error msg_id=%s", msg_id)
+
+
+def _dispatch(r, msg_id, fields, inflight: set) -> None:
+    """Запустить обработку сообщения фоновой задачей и учесть её в inflight."""
+    t = asyncio.create_task(_process_and_ack(r, msg_id, fields))
+    inflight.add(t)
+    t.add_done_callback(inflight.discard)
+
+
+async def reclaim_stale(r, inflight: set):
     """Забрать у «мёртвых» воркеров задачи, висящие в PEL дольше reclaim_min_idle_ms,
     и обработать их. Без этого сообщение, у которого воркер умер между чтением и
-    XACK, зависло бы навсегда (и застопорило бы гейт порядка диалога)."""
+    XACK, зависло бы навсегда (и застопорило бы гейт порядка диалога).
+
+    Реклеймленные задачи запускаются теми же фоновыми задачами, что и свежие (H-1):
+    реклейм НЕ должен блокировать цикл на всю генерацию. Dead-letter дёшев (без LLM),
+    поэтому его делаем на месте."""
     try:
         res = await r.xautoclaim(
             settings.inbound_stream, settings.consumer_group, CONSUMER_NAME,
@@ -365,11 +402,7 @@ async def reclaim_stale(r):
             await dead_letter(r, settings.inbound_stream, settings.consumer_group,
                               msg_id, fields, settings.dead_letter_maxlen)
             continue
-        try:
-            await process(r, fields)
-            await r.xack(settings.inbound_stream, settings.consumer_group, msg_id)
-        except Exception:
-            log.exception("reclaim process error msg_id=%s", msg_id)
+        _dispatch(r, msg_id, fields, inflight)
 
 
 # ---------- ГЛАВНЫЙ ЦИКЛ ВОРКЕРА ----------
@@ -387,6 +420,9 @@ def _install_stop(stop: asyncio.Event):
 async def main():
     setup_logging(settings.log_level)
     await migrate()                 # схема БД актуальна (идемпотентно)
+    # Прогреваем tiktoken на старте, вне горячего пути (H-2): возможный сетевой поход
+    # за BPE-рангами и синхронная инициализация случатся здесь, а не в первой генерации.
+    await asyncio.to_thread(tokens.warm_encoder)
     r = get_redis()
     await ensure_group(r)
     stop = asyncio.Event()
@@ -394,32 +430,43 @@ async def main():
     log.info("llm_worker started as %s, listening on %s",
              CONSUMER_NAME, settings.inbound_stream)
 
+    # Пул фоновых задач обработки. Их число ограничено worker_concurrency (H-1):
+    # читаем из стрима ровно столько, сколько есть свободных слотов, — не захватываем
+    # из группы больше, чем реально можем вести (иначе задачи копились бы в нашем PEL,
+    # а другие простаивающие воркеры не могли бы их взять).
+    inflight: set[asyncio.Task] = set()
+    concurrency = settings.worker_concurrency
+
     iters = 0
     while not stop.is_set():
         iters += 1
-        # периодически забираем зависшие задачи у мёртвых воркеров
-        if iters % settings.reclaim_every_iters == 0:
-            await reclaim_stale(r)
+        # периодически забираем зависшие задачи у мёртвых воркеров (тоже фоновыми
+        # задачами) — только когда есть запас по ёмкости, чтобы не перегружать воркер.
+        if iters % settings.reclaim_every_iters == 0 and len(inflight) < concurrency:
+            await reclaim_stale(r, inflight)
 
-        # блокирующее чтение новых сообщений (">" = только ещё не выданные группе)
+        # ждём, пока освободится хотя бы один слот (не крутим CPU на busy-wait)
+        while len(inflight) >= concurrency:
+            await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+
+        # блокирующее чтение новых сообщений (">" = только ещё не выданные группе).
+        # count = число свободных слотов: берём пачку и раздаём её фоновым задачам.
+        available = concurrency - len(inflight)
         resp = await r.xreadgroup(
             settings.consumer_group, CONSUMER_NAME,
-            {settings.inbound_stream: ">"}, count=1, block=5000,
+            {settings.inbound_stream: ">"}, count=available, block=5000,
         )
         if not resp:
             continue
         for _stream, entries in resp:
             for msg_id, fields in entries:
-                try:
-                    await process(r, fields)
-                    # XACK — подтверждаем обработку; иначе сообщение зависнет в PEL
-                    await r.xack(settings.inbound_stream, settings.consumer_group, msg_id)
-                except Exception:
-                    # не ackаем: сообщение останется в PEL и будет переобработано
-                    # (нашим reclaim_stale или другим воркером после таймаута).
-                    log.exception("process error msg_id=%s", msg_id)
+                _dispatch(r, msg_id, fields, inflight)
 
-    log.info("llm_worker stopping: %s", CONSUMER_NAME)
+    # МЯГКАЯ ОСТАНОВКА: перестаём читать новое и даём текущим генерациям завершиться
+    # (иначе оборвали бы ответы на лету и оставили сообщения в PEL до реклейма).
+    log.info("llm_worker stopping: %s (%d in-flight)", CONSUMER_NAME, len(inflight))
+    if inflight:
+        await asyncio.gather(*inflight, return_exceptions=True)
 
 
 if __name__ == "__main__":

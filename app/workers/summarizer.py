@@ -54,7 +54,10 @@ async def fold(old_summary: str | None, messages: list[dict]) -> str:
     резюме. Результат каждого шага ограничен summary_max_tokens (и потолком в
     промпте, и жёсткой обрезкой) — так summary не разрастается от раза к разу."""
     summary = old_summary
-    chunks = tokens.chunk_messages(messages, settings.summary_fold_chunk_tokens)
+    # tiktoken синхронный/CPU-затратный -> считаем в потоке, чтобы не блокировать
+    # event loop суммаризатора (H-2, как в llm_worker).
+    chunks = await asyncio.to_thread(
+        tokens.chunk_messages, messages, settings.summary_fold_chunk_tokens)
     for chunk in chunks:
         prompt = [
             {"role": "system",
@@ -69,7 +72,8 @@ async def fold(old_summary: str | None, messages: list[dict]) -> str:
         ]
         summary = await complete(prompt, max_tokens=settings.summary_max_tokens)
         # предохранитель от модели, проигнорившей инструкцию про длину
-        summary = tokens.truncate_text(summary, settings.summary_max_tokens)
+        summary = await asyncio.to_thread(
+            tokens.truncate_text, summary, settings.summary_max_tokens)
     return summary or ""
 
 
@@ -191,6 +195,8 @@ def _install_stop(stop: asyncio.Event):
 async def main():
     setup_logging(settings.log_level)
     await migrate()                 # схема БД актуальна (идемпотентно)
+    # Прогреваем tiktoken на старте, вне горячего пути (H-2).
+    await asyncio.to_thread(tokens.warm_encoder)
     r = get_redis()
     await ensure_group(r)
     stop = asyncio.Event()

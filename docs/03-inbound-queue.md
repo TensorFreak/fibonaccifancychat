@@ -41,12 +41,15 @@ await r.xadd(settings.inbound_stream, {
 ```python
 resp = await r.xreadgroup(
     settings.consumer_group, CONSUMER_NAME,
-    {settings.inbound_stream: ">"}, count=1, block=5000,
+    {settings.inbound_stream: ">"}, count=available, block=5000,
 )
 ```
 
 - `">"` — «отдай только записи, которые ещё никому в группе не выдавались».
 - Consumer group гарантирует: **каждая запись достаётся ровно одному воркеру**. Запусти N копий — Redis раздаст им разные сообщения. Это и есть горизонтальное масштабирование обработки.
+- `count=available` — читаем ровно столько, сколько свободных слотов параллелизма
+  (`worker_concurrency − len(inflight)`); прочитанные раздаются фоновым задачам, а не
+  обрабатываются по одной ([04](04-llm-worker.md), [10](10-hardening.md), R6-1).
 - `block=5000` — блокирующее ожидание до 5 c: нет сообщений → цикл повторяется, CPU не жжётся.
 
 `CONSUMER_NAME` уникален на процесс — `f"{hostname}-{pid}-{rnd}"` — иначе PEL/`XAUTOCLAIM` двух реплик смешались бы.
