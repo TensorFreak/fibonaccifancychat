@@ -43,3 +43,18 @@ class FakeRedis:
     async def xack(self, stream, group, msg_id):
         self.acked.append(msg_id)
         return 1
+
+    async def eval(self, script, numkeys, *args):
+        """Эмулируем ЕДИНСТВЕННЫЙ eval в коде — _ENQUEUE_LUA (атомарный приём #1):
+        INCR seq -> EXPIRE -> XADD в inbound с seq в полях, возвращаем seq. Мутируем store
+        и xadds только если дошли до конца: так эмуляция сохраняет свойство «всё или ничего»
+        реального Lua-скрипта (сбой не оставляет ни seq, ни записи в стриме).
+        KEYS=[seq_key, stream], ARGV=[ttl, maxlen, conv_id, user_id, message_id, text]."""
+        seq_key, stream = args[0], args[1]
+        _ttl, _maxlen, conv, user, mid, text = args[numkeys:numkeys + 6]
+        seq = int(self.store.get(seq_key, 0)) + 1
+        self.store[seq_key] = str(seq)
+        self.xadds.append((stream, {
+            "conversation_id": conv, "user_id": user,
+            "message_id": mid, "seq": str(seq), "text": text}))
+        return seq

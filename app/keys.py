@@ -63,6 +63,19 @@ def ws_rate(user_id: str, window: int) -> str:
     return f"rl:ws:{user_id}:{window}"
 
 
+def ws_connect_rate(user_id: str, window: int) -> str:
+    # Redis счётчик рейтлимита ЧАСТОТЫ ws-подключений пользователя в фикс. окне (#2).
+    # Отдельно от ws_rate (лимит сообщений): режет цикл connect/disconnect, плодящий
+    # транзакции Postgres (ensure_conversation создаёт строку диалога на каждый коннект).
+    return f"rl:wsconn:{user_id}:{window}"
+
+
+def auth_rate(action: str, ident: str, window: int) -> str:
+    # Redis счётчик рейтлимита попыток register/login per-IP в фикс. окне (#3): режет
+    # брутфорс пароля и CPU-DoS (каждая попытка = ~100мс bcrypt) флудом эндпоинтов.
+    return f"rl:auth:{action}:{ident}:{window}"
+
+
 def ws_conns(user_id: str) -> str:
     # Redis ZSET ОДНОВРЕМЕННЫХ ws-соединений пользователя (H2): member = id соединения,
     # score = время протухания. ZADD при коннекте, ZREM при обрыве, heartbeat продлевает

@@ -54,4 +54,7 @@ async def test_gap_timeout_skips_lost_predecessor():
     assert await w._order_gate(r, CID, 7, fields) is True
     # applied сдвинут до seq-1, чтобы 7 применилось как applied+1.
     assert r.store[keys.conv_applied(CID)] == "6"
-    assert not r.xadds                            # больше не requeue'им
+    # Разрыв перешагнули, а не отложили: НЕ requeue'им в inbound-стрим. Единственный XADD —
+    # аудит-событие потери хода в order_loss-ленту (C3), а не возврат задачи в очередь.
+    assert not any(s == settings.inbound_stream for s, _ in r.xadds)
+    assert [s for s, _ in r.xadds] == [keys.order_loss_stream(settings.inbound_stream)]

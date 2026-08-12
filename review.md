@@ -1,142 +1,117 @@
-# CRITICAL PROD READINESS — ревью chat-backend
+# Mission-critical review — chat-backend
 
-_Дата: 2026-08-12. Скоуп: вся кодовая база (`app/`, `migrations/`, Dockerfile, compose)._
+_Date: 2026-08-12. Scope: full codebase (`app/`, `migrations/`, Dockerfile, compose,
+frontend). Zero-trust pass — reviewed against the actual code, not prior reviews/docs._
+_Auth model (email+password without verification) is out of scope by owner's decision._
 
-## Вердикт
+## Verdict
 
-Ядро распределённой логики — **крепкое и проверено прогонами**: идемпотентность на уровне
-БД, FIFO-порядок при N воркерах, resumable-стриминг, мультиинстанс без sticky-сессий,
-миграции, keyset-пагинация, контроль длины промпта.
+The distributed core is genuinely strong: DB-level idempotency (`ON CONFLICT
+(message_id, role)`), FIFO ordering by `seq` across N workers, resumable streaming with
+`active_gen` catch-up, owner-aware locks with heartbeat, dead-letter, real context-window
+ceiling, migrations under advisory-lock, keyset pagination, no SQL injection, no cross-user
+leakage, XSS-safe client. Not a typical MVP.
 
-В этом проходе закрыты **mission-critical правки по корректности инфраструктуры и
-архитектуры**. Осознанно отложены (по решению владельца) вопросы «реальности
-аутентификации» и часть ops-обвязки — см. «Осталось».
-
-**Статус:** пригоден для теста на команду и близок к прод-готовности по инфраструктуре;
-до полноценного публичного прода остаётся auth-интеграция, anti-abuse и наблюдаемость.
-
----
-
-## Закрыто в этом проходе (с проверкой)
-
-| # | Проблема | Что сделано | Проверка |
-|---|---|---|---|
-| 1 | **Redis OOM**: стримы росли без границ (`XACK` не удаляет из стрима) | `XADD … MAXLEN ~` на `chat:inbound`/`chat:summarize` | 5000 XADD → `XLEN=100` |
-| 2 | **Зависший LLM блокирует воркер навсегда** (`Timeout(None)`) | connect/read/write-таймауты + переиспользуемый `AsyncClient` | code review |
-| 3 | **Замок истекал во время долгой генерации** → дубль-обработка | TTL 300 c (конфиг) + heartbeat-продление | ген 4 c при TTL 2 c — замок жив, генерация одна |
-| 4 | **Вечный re-enqueue** при потерянном `seq` → диалог завис навсегда | liveness-таймаут гейта: перешагиваем разрыв | applied перескакивает дыру |
-| 5 | **Суммаризатор**: OOM при отставании + потеря задачи умершего процесса | лимит `summary_max_fetch` + дозапуск; `reclaim_stale` (PEL) | watermark сдвинут, дозадача в очереди |
-| 6 | **bcrypt блокировал event loop** api | `asyncio.to_thread`; пароль ≤72 байт (не крашится) + лимит длины | login async ок, длинный пароль→400 |
-| 7 | **Pub/Sub не переживал рестарт Redis** (тихая потеря событий) | `pump_out` переподписывается + повторный догон `active_gen` | code review |
-| 8 | **Небезопасный дефолт секрета** | фейл-фаст: не стартуем с дефолтным `auth_secret` при `auth_dev_mode=false` | старт отклонён/пропущен по условию |
-| 9 | **Контейнер от root** | Dockerfile: непривилегированный `appuser`; api `--proxy-headers` | compose валиден |
-
-Все правки прошли **регрессионный сквозной smoke** (регистрация/логин на async-bcrypt,
-стриминг, история) без регрессий.
+This pass fixed the one HIGH availability/correctness bug and the two cheapest DoS gaps.
+The rest below is the tracked backlog before full public prod.
 
 ---
 
-## Проход 2 (2026-08-12): критичные и high-фиксы
+## Fixed in this pass (verified by code)
 
-Второй прод-проход поймал дефекты, пропущенные первым. Детали и обоснования —
-[`docs/10-hardening.md` → раздел R2](docs/10-hardening.md).
+### [#1 · HIGH] Atomic message ingest — `seq` could diverge from the stream → 15-min conversation freeze
+`seq` was allocated by `INCR` **before** `XADD`. Any failure between them (`server_busy`
+on a Redis blip, process kill) burned a seq number that never entered the stream; the
+order-gate then treated it as a gap and waited `order_gap_timeout_ms` (default 900 s),
+freezing the whole conversation and finally dropping the turn.
+**Fix:** `INCR seq` + `EXPIRE` + `XADD` are now one atomic Lua script (`_ENQUEUE_LUA` in
+`app/api/main.py`). Either both happen or neither — seq can no longer diverge from the
+stream. Stale `server_busy` self-heal comment updated.
 
-| # | Проблема | Что сделано |
-|---|---|---|
-| R2-1 🔴 | **Fail-open дефолт auth**: `auth_dev_mode=True` по умолчанию → любой токен = личность, auth выключен | дефолт → `False` (fail-closed); старт-гард отвергает слабый/плейсхолдерный `AUTH_SECRET` (<32 симв.) |
-| R2-2 🔴 | **Небезопасное снятие замка**: безусловный `DEL` мог снести замок, перехваченный другим воркером → параллельная обработка диалога | `app/locks.py`: owner-aware release (Lua `GET==token→DEL`) в обоих воркерах |
-| R2-3 🟠 | **Утечка ленты `gen:`**: при жёстком падении воркера лента оставалась без TTL навсегда | active-TTL (`gen_active_ttl_seconds`) на первом токене + продление в цикле |
-| R2-4 🟠 | **Флуд в общий inbound-стрим** вытеснял по `MAXLEN` недоставленные сообщения ДРУГИХ юзеров | per-user рейтлимит на входе ws (`INCR`+`EXPIRE`, до расхода `seq`/`XADD`) |
-| R2-5 🟠 | **Пропуск FIFO-разрыва** под backlog мог тихо терять реальные (лишь опоздавшие) сообщения | таймаут поднят 30 c → 120 c; каждый пропуск логируется как `[order][LOSS]` для алертов |
+### [#2 · MEDIUM] WS connection-rate limit — unbounded conversation creation on Postgres
+`ensure_conversation` creates the conversation row on connect; only *concurrent*
+connections were capped, not connection *rate*, so a connect/disconnect loop over fresh
+UUIDs was an unbounded transaction/row DoS on the shared DB.
+**Fix:** per-user fixed-window connect limiter (`_allow_ws_connect`, keys `rl:wsconn:*`),
+checked **before** the DB hit. Config: `WS_CONNECT_RATE_MAX=60` / window 60 s. Fail-open on
+Redis error.
 
----
-
-## Проход 3 (2026-08-12): MEDIUM-фиксы
-
-MEDIUM-замечания, закрытые когерентно с логикой порядка/идемпотентности. Детали —
-[`docs/10-hardening.md` → раздел R3](docs/10-hardening.md).
-
-| # | Проблема | Что сделано |
-|---|---|---|
-| R3-M1 🟡 | **Безлимитный рост** `seq:conv:*`/`applied:conv:*`/`since_sum:*` в Redis (нет TTL) → медленный OOM | idle-TTL `conv_counter_ttl_seconds`; когерентное продление (`ttl(seq)>=ttl(applied)`), чтобы TTL не сломал FIFO ложным дропом |
-| R3-M2 🟡 | **At-least-once генерация**: краш между вставкой ответа и `applied` → двойной вызов LLM + расхождение клиент/БД | идемпотентность хода через `db.assistant_exists` (не регенерим уже сохранённый ответ); валидатор таймингов замка/реклейма + `reclaim_min_idle_ms` 120k→300k |
-| R3-M3 🟡 | **Нет таймаута запросов Postgres** → зависший запрос исчерпывает пул | `command_timeout` + серверный `statement_timeout` на пуле (миграции по отдельному соединению не задеты) |
-
----
-
-## Проход 4 (2026-08-12): свежий обзор кода — HIGH + MEDIUM
-
-Независимый сквозной проход по коду (не по докам). Детали —
-[`docs/10-hardening.md` → раздел R4](docs/10-hardening.md).
-
-| # | Проблема | Что сделано |
-|---|---|---|
-| R4-H1 🟠 | **Стриминг молча умирал при TTFT > 5 c**: тейл путал «ленты ещё нет» с «лента протухла» и сдавался до первого токена → пустой висящий бабл | сдаёмся только если генерация уже не активна (`active_gen` != этот `message_id`); во время TTFT ждём |
-| R4-M1 🟡 | **Замок суммаризатора** (120 c, без heartbeat) истекал под долгой свёрткой → дублирующая работа | TTL в конфиг (`summarize_lock_ttl_seconds`) + heartbeat; общий owner-aware `heartbeat_lock` в `app/locks.py` (llm_worker переведён на него же) |
+### [#3 · MEDIUM] Auth endpoint rate limit — brute-force + bcrypt CPU-DoS
+`/api/register` and `/api/login` had no throttle: unthrottled password brute-force, and
+each call runs bcrypt (~100 ms CPU) in the threadpool → flood = CPU-DoS; register also
+created unbounded users.
+**Fix:** per-IP fixed-window limiter (`_rate_limit_auth`, keys `rl:auth:*`) on both
+endpoints, returns 429. Config: `AUTH_RATE_MAX=10` / window 60 s. Uses `request.client`
+(real client IP via `--proxy-headers`). Fail-open on Redis error.
 
 ---
 
-## Проход 5 (2026-08-12): LOW-фиксы + читаемые логи
+## Open backlog (not yet addressed)
 
-Детали — [`docs/10-hardening.md` → раздел R5](docs/10-hardening.md).
+### MEDIUM
 
-| # | Проблема | Что сделано |
-|---|---|---|
-| R5-1 🟢 | Моргание Redis во входном цикле ws роняло сокет (и так все сокеты сразу) | try/except вокруг Redis-приёма: `server_busy` клиенту, сокет живёт |
-| R5-2 🟢 | Пустой ответ модели сохранялся пустым сообщением ассистента | пустой ответ → `end` с `error`, ассистент не пишется, ход завершается без ретрая |
-| R5-3 🟢 | Длина email не ограничена | лимит `email_max_chars` (254) |
-| R5-4 🟢 | «Отравленная» задача крутилась в PEL вечно | dead-letter в `<stream>:dead` после `max_deliveries` (оба воркера) |
-| R5-5 🟢 | `print()` вместо логов | единый читаемый формат в stdout (`app/log.py`), логгеры компонентов, трейсбеки на ошибках |
+- **[#4] JWT in the WebSocket URL query string.** The 7-day, non-revocable token rides in
+  `ws://…/ws/{id}?token=<jwt>` and lands in Caddy/uvicorn access logs (query strings are
+  logged where headers/bodies are not). Move the token to the first WS message, or issue a
+  short-lived single-use ticket over HTTPS. (CSWSH itself is not exploitable — auth isn't
+  cookie-based.)
+
+- **[#5] `MAXLEN ~` on the shared inbound stream can silently drop un-processed messages.**
+  Trimming removes oldest entries regardless of PEL/ack state; under a large backlog (100k+)
+  those become dangling PEL refs that reclaim just acks and discards → silent turn loss. The
+  per-user message rate limit bounds a single tenant, not the aggregate. Consider per-shard
+  streams or ingress backpressure (reject) instead of trimming a durable queue.
+
+- **[#6] Summarizer outage → silent "context hole".** Hot window holds only the last
+  `ctx_max_messages` (40); older content must live in `summary`. If the summarizer is
+  down/dead-lettered, messages that scroll out of the window but were never folded are
+  silently absent from the LLM prompt — the model loses the middle of long conversations.
+  Detected and written to `chat:summarize:lag`, but nothing self-heals while it's down and
+  nothing is wired to alert. **Wire `:lag`, `chat:inbound:order_loss`, and `*:dead` streams
+  to real alerting before prod** — otherwise these degradations are invisible.
+
+- **[#7] Order-gate busy-requeue burns worker slots + Redis I/O.** While waiting on a real
+  gap, each successor is re-`XADD`'d and `sleep(0.05)`'d, then immediately re-read — ~20
+  XADD/s per stuck message for up to 900 s, each holding a `worker_concurrency` slot. A
+  single stuck predecessor with queued successors degrades throughput. Prefer exponential
+  backoff or a per-conversation "parked" set over hot-looping the shared stream.
+
+- **[#8] Redis `appendfsync everysec` + fire-and-forget ingest.** Up to ~1 s of accepted
+  `XADD`s / `INCR`s can be lost on a hard Redis crash, and the API returns nothing to the
+  client after `XADD` — the user believes the message was sent. Contradicts "ultimate
+  persistence" at the ingest boundary. Options: `appendfsync always` (throughput cost), or
+  ack to the client only after a durable write.
+
+### LOW / hardening
+
+- **`save_summary` can create an orphan conversation with `NULL user_id`** — the UPSERT
+  inserts `(id, summary, summary_upto_id)` with no `user_id` if the row is missing. Guard
+  against inserting a new row, or backfill `user_id`.
+- **Counter-TTL divergence** (edge): if `applied` (1-day TTL) expires while `seq` keeps
+  being refreshed under a prolonged worker outage, the next message can look like a huge gap
+  and drop a batch. The two TTLs are only conventionally coupled.
+- **No Redis AUTH/TLS** — fine on single-host compose (ports unpublished); add `requirepass`
+  before any multi-host deploy.
+- **No email-format validation**; bcrypt silently truncates to 72 bytes.
+- **`messages` has no FK to `conversations`** — orphan rows possible; no cascade (no delete
+  feature exists yet, so latent).
+- **JWT in `localStorage`** — standard tradeoff, but XSS = theft of a 7-day, non-revocable
+  token. No `jti` / rotation / revocation list.
+- **Tests** — now cover `_order_gate`, `_dispatch`, prompt assembly, the atomic-ingest
+  path (#1, incl. the all-or-nothing failure case), and the #2/#3 rate limiters
+  (`tests/test_ingest_and_limits.py`). Still **uncovered**: the resumable stream tail
+  (`tail_generation`), reconnect/`pump_out` replay, and idempotent double-processing
+  (`assistant_exists` / reclaim). Those are the next highest-value targets and need a real
+  or faked Redis-stream harness.
 
 ---
 
-## Осталось (осознанно отложено)
+## Verified solid (no action)
 
-### Аутентификация (по решению владельца — оставляем простую email+пароль)
-- Реальный корп-**SSO/OIDC**, сброс пароля, верификация email.
-- **Отзыв токенов** (JWT живёт 7 дней и неотзываем) — при увольнении/утечке нельзя выкинуть.
-- **Рейтлимит** на `/api/register`/`/api/login` (перебор паролей) — рекомендуется на прокси.
-
-### Anti-abuse / нагрузка
-- Рейтлимит потока ws-сообщений — **сделано in-app** (R2-4, per-user). Остаётся: лимит на
-  **создание диалогов** (аутентифицированный пользователь всё ещё может плодить их без
-  предела через подключение к `/ws/{random-uuid}`) и L7-лимит на auth-эндпоинты на прокси.
-- **PgBouncer** при масштабировании (соединения `(api+worker+summarizer)×10` против
-  дефолтных 100) — см. [docs/12](docs/12-scaling.md).
-- Ретраи с backoff на 429/5xx от LLM (сейчас — переобработка через reclaim, медленно).
-
-### Наблюдаемость / эксплуатация
-- **Читаемые логи** (уровни, компоненты, трейсбеки) — **сделано** (R5-5). Остаётся при
-  желании: структурный JSON под внешний сборщик и correlation-id.
-- **Метрики** (Prometheus) и **readiness-проба** (сейчас `/healthz` не проверяет зависимости).
-- **Тест-набор в CI** — сейчас проверки ад-хок, автотестов в репозитории нет.
-
-### Прочее (документировано ранее)
-- `user_message`-эхо эфемерно (при обрыве не переигрывается) — [docs/10](docs/10-hardening.md).
-- Единый inbound-стрим не шардирован (FIFO решает корректность, но это точка нагрузки).
-- Секреты/TLS Redis/Postgres — задача инфраструктуры.
-
----
-
-## Чек-лист перед go-live
-
-- [ ] `AUTH_SECRET` = длинная случайная строка (≥32 симв.); `AUTH_DEV_MODE=false` — теперь
-      это ДЕФОЛТ, а старт-гард отвергает слабый/плейсхолдерный секрет (R2-1).
-- [ ] `CONTEXT_WINDOW_TOKENS` под вашу модель; `LLM_API_KEY`/`LLM_API_URL`/`LLM_MODEL`.
-- [ ] HTTPS-прокси (Caddy/nginx) перед api; `CORS_ALLOW_ORIGINS` сузить до домена.
-- [ ] Пароль Redis, закрыть порты 5432/6379 наружу.
-- [ ] Рейтлимит ws-сообщений — уже in-app (R2-4); настроить `WS_RATE_*` под ожидаемый темп.
-      Рейтлимит на auth-эндпоинты (`/api/login`,`/api/register`) — на прокси.
-- [ ] `restart: unless-stopped`, сбор логов, метрики/алерты.
-- [ ] Проверить `reclaim_min_idle_ms`/`conv_lock_ttl_seconds` > максимального времени ответа модели
-      (соотношение `reclaim >= lock_ttl*1000` и `heartbeat < lock_ttl` теперь проверяет старт-гард, R3-M2).
-- [ ] (Позже) интеграция корп-SSO.
-
----
-
-## Что не трогать — уже надёжно
-
-Идемпотентность (`INSERT … ON CONFLICT` по `message_id`), FIFO-порядок (`seq` + перепроверка
-под замком), resumable-стриминг (durable-лента + `active_gen`), мультиинстанс через Redis,
-миграции (advisory-lock), keyset-пагинация, контроль длины промпта под окно модели,
-защита от XSS (клиент рендерит через `textContent`).
+No SQL injection (parameterized + `uuid.UUID` coercion); no cross-user leakage (ownership
+gates + conversation-namespaced stream keys); JWT fixed `algorithms=["HS256"]` with `exp`,
+fail-closed, config refuses weak secret in non-dev; retry/reclaim idempotency prevents
+double-charged LLM calls; owner-aware Lua lock release; startup config invariants
+(lock/reclaim/gap timing, window ≥ keep+trigger, budget ≤ context window, pool ≥
+concurrency); Postgres/Redis ports unpublished, non-root container, TLS via Caddy,
+`--forwarded-allow-ips` scoped.

@@ -24,8 +24,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import (Body, Depends, FastAPI, Header, HTTPException, WebSocket,
-                     WebSocketDisconnect)
+from fastapi import (Body, Depends, FastAPI, Header, HTTPException, Request,
+                     WebSocket, WebSocketDisconnect)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
@@ -74,6 +74,27 @@ async def current_user(authorization: str = Header(default="")) -> str:
     return user_id
 
 
+# ---------- Рейтлимит попыток аутентификации (#3) ----------
+
+async def _rate_limit_auth(request: Request, action: str) -> None:
+    """Фиксированное окно per-IP на register/login (#3). Режет брутфорс пароля и
+    CPU-DoS (bcrypt ~100мс на попытку). IP берём из request.client (с --proxy-headers
+    это реальный клиент из X-Forwarded-For доверенного прокси). Redis моргнул — НЕ
+    блокируем вход (fail-open: лимит — защита, а не критичный путь)."""
+    ip = request.client.host if request.client else "unknown"
+    window = int(time.time()) // settings.auth_rate_window_seconds
+    key = keys.auth_rate(action, ip, window)
+    try:
+        n = await get_redis().incr(key)
+        if n == 1:
+            await get_redis().expire(key, settings.auth_rate_window_seconds)
+    except Exception as e:
+        log.warning("auth rate-limit redis error action=%s: %r", action, e)
+        return
+    if n > settings.auth_rate_max:
+        raise HTTPException(status_code=429, detail="too many attempts")
+
+
 # ---------- Регистрация / вход ----------
 
 def _norm_credentials(body: dict, min_len: int = 0) -> tuple[str, str]:
@@ -91,7 +112,8 @@ def _norm_credentials(body: dict, min_len: int = 0) -> tuple[str, str]:
 
 
 @app.post("/api/register")
-async def register(body: dict = Body(...)):
+async def register(request: Request, body: dict = Body(...)):
+    await _rate_limit_auth(request, "register")            # #3: режем флуд/брутфорс
     email, password = _norm_credentials(body, min_len=6)   # политика длины — при регистрации
     if await db.get_user_by_email(email):
         raise HTTPException(status_code=409, detail="email already registered")
@@ -100,7 +122,8 @@ async def register(body: dict = Body(...)):
 
 
 @app.post("/api/login")
-async def login(body: dict = Body(...)):
+async def login(request: Request, body: dict = Body(...)):
+    await _rate_limit_auth(request, "login")     # #3: режем брутфорс пароля
     email, password = _norm_credentials(body)   # на входе минимум не навязываем
     user = await db.get_user_by_email(email)
     if not user or not user["password_hash"] or \
@@ -239,6 +262,51 @@ async def _ws_conn_heartbeat(r, user_id: str, conn_id: str):
             pass                                       # моргание Redis не должно рвать сокет
 
 
+# Атомарный приём сообщения (#1): INCR seq + XADD в inbound ОДНИМ Lua-скриптом (в Redis
+# скрипт атомарен). Прежде seq выделялся INCR'ом ДО XADD, и любой сбой между ними
+# (server_busy при моргании Redis, падение процесса) выжигал номер, которого НЕТ в
+# стриме -> гейт порядка воспринимал его как «дыру» и ждал order_gap_timeout (до 15 мин),
+# замораживая весь диалог, после чего терял ход. Теперь либо оба шага, либо ни одного:
+# seq не может разойтись с содержимым стрима.
+# KEYS[1]=seq-ключ, KEYS[2]=inbound-стрим; ARGV: ttl, maxlen, conv_id, user_id, msg_id, text.
+_ENQUEUE_LUA = (
+    "local seq = redis.call('INCR', KEYS[1]) "
+    "redis.call('EXPIRE', KEYS[1], ARGV[1]) "
+    "redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[2], '*', "
+    "'conversation_id', ARGV[3], 'user_id', ARGV[4], "
+    "'message_id', ARGV[5], 'seq', tostring(seq), 'text', ARGV[6]) "
+    "return seq"
+)
+
+
+async def _enqueue_inbound(r, conversation_id: str, user_id: str, text: str) -> int:
+    """Единая точка приёма (#1): INCR seq + XADD в inbound ОДНИМ атомарным Lua-скриптом,
+    возвращает seq. Вынесено из ws-обработчика ради тестируемости горячего пути и чтобы
+    приём был в одном месте. Аргументы скрипта: KEYS=[seq-ключ, inbound-стрим],
+    ARGV=[ttl, maxlen, conv_id, user_id, message_id, text]."""
+    return await r.eval(
+        _ENQUEUE_LUA, 2,
+        keys.conv_seq(conversation_id), settings.inbound_stream,
+        settings.conv_counter_ttl_seconds, settings.inbound_stream_maxlen,
+        conversation_id, user_id, str(uuid.uuid4()), text,
+    )
+
+
+async def _allow_ws_connect(r, user_id: str) -> bool:
+    """Рейтлимит ЧАСТОТЫ ws-подключений per-user, фиксированное окно (#2).
+
+    Лимит concurrent-соединений (ws_max_connections_per_user) НЕ покрывает цикл
+    connect/disconnect на новые UUID: каждый коннект проходит ensure_conversation
+    (транзакция + INSERT строки диалога в Postgres), т.е. вектор DoS на БД. Режем частоту
+    коннектов INCR+EXPIRE в окне (общий на все инстансы api), проверяем ДО обращения к БД."""
+    window = int(time.time()) // settings.ws_connect_rate_window_seconds
+    key = keys.ws_connect_rate(user_id, window)
+    n = await r.incr(key)
+    if n == 1:
+        await r.expire(key, settings.ws_connect_rate_window_seconds)
+    return n <= settings.ws_connect_rate_max
+
+
 async def _allow_ws_message(r, user_id: str) -> bool:
     """Рейтлимит входящих ws-сообщений per-user, фиксированное окно (H2).
 
@@ -325,6 +393,15 @@ async def ws_endpoint(ws: WebSocket, conversation_id: str):
     except ValueError:
         await ws.close(code=1008)
         return
+    # РЕЙТЛИМИТ ЧАСТОТЫ КОННЕКТОВ (#2): ДО обращения к БД, чтобы цикл connect/disconnect
+    # на новые UUID не хаммерил Postgres транзакциями ensure_conversation. Redis моргнул —
+    # не блокируем вход из-за учёта (fail-open, как и прочие лимиты).
+    try:
+        if not await _allow_ws_connect(r, user_id):
+            await ws.close(code=1013)       # try again later
+            return
+    except Exception as e:
+        log.warning("ws connect rate-limit redis error: %r", e)
     # ПОТОЛОК ОДНОВРЕМЕННЫХ СОЕДИНЕНИЙ на пользователя (H2): проверяем ДО обращения к БД,
     # чтобы флуд коннектов одним токеном не хаммерил Postgres (ensure_conversation —
     # транзакция на каждый коннект). Учёт — ZSET дедлайнов, общий на все инстансы (см.
@@ -458,29 +535,19 @@ async def ws_endpoint(ws: WebSocket, conversation_id: str):
                     await send(json.dumps({"type": "error", "error": "rate_limited"}))
                     continue
 
-                # seq — монотонный номер сообщения в диалоге (FIFO-порядок в воркере).
-                # Продлеваем TTL счётчика на активности (M1): в паре с продлением в воркере
-                # (_mark_applied) это держит seq живым не меньше applied, а после простоя
-                # оба протухают вместе -> счёт с нуля, без ложных дропов.
-                seq = await r.incr(keys.conv_seq(conversation_id))
-                await r.expire(keys.conv_seq(conversation_id),
-                               settings.conv_counter_ttl_seconds)
-
-                # XADD кладёт задачу в durable-очередь и мгновенно возвращает управление.
-                # Пользователь может слать новые сообщения, не дожидаясь ответа LLM.
-                # MAXLEN ~ ограничивает рост стрима (XACK убирает из PEL, но не из стрима).
-                await r.xadd(settings.inbound_stream, {
-                    "conversation_id": conversation_id,
-                    "user_id": user_id,
-                    "message_id": str(uuid.uuid4()),
-                    "seq": str(seq),
-                    "text": text,
-                }, maxlen=settings.inbound_stream_maxlen, approximate=True)
+                # ПРИЁМ (#1): seq (монотонный номер сообщения — FIFO-порядок в воркере) и
+                # XADD задачи в durable-очередь — ОДНИМ атомарным Lua-скриптом (см.
+                # _enqueue_inbound). Так номер не может разойтись с содержимым стрима: раньше
+                # сбой между INCR и XADD выжигал seq, которого нет в очереди, и гейт порядка
+                # замораживал диалог на order_gap_timeout. XADD мгновенно возвращает
+                # управление — юзер может слать дальше, не ожидая LLM.
+                await _enqueue_inbound(r, conversation_id, user_id, text)
             except WebSocketDisconnect:
                 raise
             except Exception as e:
                 # Redis моргнул: сокет живой, сообщение не принято. Клиент может повторить.
-                # Возможный расход seq без XADD самозалечит FIFO-гейт по order_gap_timeout.
+                # Приём атомарен (#1): при сбое НЕ расходуется ни seq, ни запись в стриме —
+                # дыры в порядке не возникает, следующее сообщение примется как обычно.
                 log.warning("inbound redis error conv=%s: %r", conversation_id, e)
                 await send(json.dumps({"type": "error", "error": "server_busy"}))
                 continue
