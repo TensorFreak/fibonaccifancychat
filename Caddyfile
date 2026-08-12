@@ -1,0 +1,10 @@
+# Единая точка входа + TLS-терминация (H3).
+# SITE_ADDRESS из окружения (docker-compose):
+#   :80                     -> HTTP «из коробки» (localhost/по IP), без сертификата;
+#   chat.example.com        -> Caddy сам получит и продлит TLS-сертификат (Let's Encrypt),
+#                              а http автоматически редиректит на https.
+# reverse_proxy прозрачно проксирует и обычные запросы, и WebSocket (Upgrade),
+# и проставляет X-Forwarded-Proto/For, которым доверяет uvicorn (--forwarded-allow-ips).
+{$SITE_ADDRESS} {
+	reverse_proxy api:8000
+}

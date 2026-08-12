@@ -113,10 +113,10 @@ docker compose up --build
 docker compose up --scale api=3 --scale worker=4
 ```
 
-Тест-клиент (websocat):
+Тест-клиент (websocat) — вход через `caddy` (порт 80), `api` наружу не публикуется:
 ```bash
-websocat ws://localhost:8000/ws/00000000-0000-0000-0000-000000000001
-> {"user_id":"u1","text":"привет"}
+websocat "ws://localhost/ws/00000000-0000-0000-0000-000000000001?token=<jwt>"
+> {"text":"привет"}
 ```
 (предварительно вставь строку в conversations, или ослабь FK для теста)
 

@@ -293,9 +293,42 @@ async def ws_endpoint(ws: WebSocket, conversation_id: str):
     except ValueError:
         await ws.close(code=1008)
         return
-    if not await db.ensure_conversation(conversation_id, user_id):
-        await ws.close(code=1008)          # диалог принадлежит другому пользователю
+    # ПОТОЛОК ОДНОВРЕМЕННЫХ СОЕДИНЕНИЙ на пользователя (H2): проверяем ДО обращения к БД,
+    # чтобы флуд коннектов одним токеном не хаммерил Postgres (ensure_conversation —
+    # транзакция на каждый коннект). INCR общий на все инстансы; safety-TTL страхует от
+    # утечки счётчика, если инстанс умер без DECR. release_conn() снимает слот на ЛЮБОМ
+    # выходе (ровно один раз).
+    conn_key = keys.ws_conns(user_id)
+    conn_counted = False
+    try:
+        n_conns = await r.incr(conn_key)
+        await r.expire(conn_key, settings.conv_lock_ttl_seconds * 2)
+        conn_counted = True
+    except Exception:
+        n_conns = 1                        # Redis моргнул — не блокируем вход из-за учёта
+
+    async def release_conn():
+        nonlocal conn_counted
+        if conn_counted:
+            conn_counted = False
+            try:
+                await r.decr(conn_key)
+            except Exception:
+                pass                       # safety-TTL уберёт счётчик, если DECR не прошёл
+
+    if n_conns > settings.ws_max_connections_per_user:
+        await release_conn()
+        await ws.close(code=1013)          # try again later
         return
+
+    try:
+        if not await db.ensure_conversation(conversation_id, user_id):
+            await release_conn()
+            await ws.close(code=1008)      # диалог принадлежит другому пользователю
+            return
+    except BaseException:
+        await release_conn()               # не удержим слот, если упали до основного finally
+        raise
 
     # Курсор догона control-событий. Клиент передаёт last_event_id — id последнего
     # ПРИМЕНЁННОГО события ленты events:{id}: при первом коннекте это events_cursor из
@@ -423,6 +456,7 @@ async def ws_endpoint(ws: WebSocket, conversation_id: str):
         out_task.cancel()
         for t in tasks:
             t.cancel()
+        await release_conn()               # освободить слот соединения пользователя (H2)
 
 
 @app.get("/healthz")

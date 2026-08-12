@@ -200,6 +200,17 @@ async def _order_gate(r, conversation_id: str, seq: int, fields: dict) -> bool:
             log.warning("[order][LOSS] conv=%s: gap timeout after %dms, dropping "
                         "seq %d..%d, applying seq=%d", conversation_id,
                         settings.order_gap_timeout_ms, applied + 1, seq - 1, seq)
+            # C3: событие потери — не только в лог, но и в durable-поток аудита, чтобы на
+            # него можно было завести алерт/метрику, а не грепать stdout.
+            try:
+                await r.xadd(keys.order_loss_stream(settings.inbound_stream),
+                             {"conversation_id": conversation_id,
+                              "dropped_from": str(applied + 1), "dropped_to": str(seq - 1),
+                              "applied": str(seq), "at_ms": str(int(now_ms))},
+                             maxlen=settings.dead_letter_maxlen, approximate=True)
+            except Exception as e:                 # аудит не должен ломать обработку
+                log.warning("order_loss audit xadd failed conv=%s: %r",
+                            conversation_id, e)
             return True
         if not gate_since:
             fields = {**fields, "gate_since": str(now_ms)}   # засекаем первое ожидание

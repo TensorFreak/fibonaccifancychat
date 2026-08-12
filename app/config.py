@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     # попадает (длинный DDL не оборвётся). Держите оба > самого долгого штатного запроса.
     pg_command_timeout: float = 30.0
     pg_statement_timeout_ms: int = 30000
+    # Размер пула соединений Postgres (на КАЖДЫЙ процесс api/воркера). Соединение берётся
+    # на один запрос и сразу возвращается (во время генерации LLM оно НЕ удерживается),
+    # поэтому пул должен покрывать пик ОДНОВРЕМЕННЫХ запросов = worker_concurrency (H1).
+    # Валидатор требует pg_pool_max_size >= worker_concurrency. ВНИМАНИЕ при scale:
+    # суммарно к БД = pg_pool_max_size * (число процессов api+воркеров) — держите ниже
+    # max_connections Postgres (по умолчанию 100).
+    pg_pool_min_size: int = 1
+    pg_pool_max_size: int = 32
 
     # внешний LLM API (OpenAI-совместимый по формату; подставь свой)
     llm_api_url: str = "https://api.openai.com/v1/chat/completions"
@@ -122,6 +130,12 @@ class Settings(BaseSettings):
     # для человека, но режут флуд.
     ws_rate_max_messages: int = 30       # сообщений за окно на пользователя
     ws_rate_window_seconds: int = 10     # длина окна (сек)
+    # Потолок ОДНОВРЕМЕННЫХ ws-соединений на пользователя (H2). Без него один токен
+    # может открыть неограниченно сокетов: каждый коннект — транзакция в Postgres
+    # (ensure_conversation) + фоновые задачи, т.е. вектор DoS на БД. Считаем per-user в
+    # Redis (общий на все инстансы api), проверяем ДО обращения к БД. Значение щедрое для
+    # человека с несколькими вкладками/устройствами, но режет флуд соединений.
+    ws_max_connections_per_user: int = 20
 
     # Максимальная длина пароля (bcrypt режет на 72 байтах и кидает на длинных).
     password_max_chars: int = 128
@@ -150,8 +164,9 @@ class Settings(BaseSettings):
     # Postgres). Порядок ВНУТРИ диалога держат seq-гейт и замок диалога, поэтому
     # параллелятся только РАЗНЫЕ диалоги. Держите с запасом ниже, чем позволяет пул
     # Postgres (max_size) и лимиты Redis; при росте — сначала поднимите этот параметр,
-    # а не число процессов.
-    worker_concurrency: int = 32
+    # а не число процессов. ИНВАРИАНТ (H1): worker_concurrency <= pg_pool_max_size
+    # (иначе пик одновременных запросов упрётся в пул и они сериализуются на acquire).
+    worker_concurrency: int = 24
     # Реклейм зависших задач: заберём у «мёртвого» воркера всё, что висит в PEL
     # дольше этого простоя (мс). ВАЖНО: держите заметно больше максимального времени
     # генерации ответа, иначе долгий (напр. на большом контексте) ответ,
@@ -188,9 +203,17 @@ class Settings(BaseSettings):
     # худшей задержки очереди, гейт пропустит разрыв, а опоздавшее РЕАЛЬНОЕ сообщение
     # потом отсеётся как seq<=applied (тихая потеря хода). Поэтому дефолт консервативный
     # (держите его БОЛЬШЕ p99 задержки «XADD -> вычитка воркером» под пиковой нагрузкой),
-    # а каждый факт пропуска логируется (см. _order_gate) — это событие потери, следите
-    # за ним в метриках/алертах.
-    order_gap_timeout_ms: int = 120000
+    # а каждый факт пропуска логируется И пишется в поток <inbound>:order_loss (см.
+    # _order_gate) — это событие потери, заведите на него алерт.
+    #
+    # КРИТИЧНЫЙ ИНВАРИАНТ (C1): order_gap_timeout_ms > reclaim_min_idle_ms +
+    # conv_lock_ttl_seconds*1000. Иначе сообщение, чей воркер УПАЛ после прохода гейта, но
+    # до XACK (напр. ошибка LLM), висит в PEL и переобрабатывается только через
+    # reclaim_min_idle; если гейт «сдаётся» раньше, преемник перешагнёт разрыв и это
+    # сообщение потом отсеётся как seq<=applied -> ход потерян БЕЗВОЗВРАТНО. Порог должен
+    # дать зависшему предшественнику успеть реклеймнуться И догенерироваться (ещё один
+    # lock_ttl) прежде, чем гейт признает его потерянным. Валидатор ниже это требует.
+    order_gap_timeout_ms: int = 900000
 
     # Суммаризация: максимум сообщений, вычитываемых за один заход (защита от OOM,
     # если суммаризатор далеко отстал). Если хвост длиннее — доработается следующей
@@ -262,6 +285,21 @@ class Settings(BaseSettings):
                 "(don't reclaim a task before a dead worker's lock would expire)")
         if self.worker_concurrency < 1:
             raise ValueError("worker_concurrency must be >= 1")
+        if self.worker_concurrency > self.pg_pool_max_size:
+            raise ValueError(
+                "worker_concurrency must be <= pg_pool_max_size (H1): the pool must "
+                "cover the peak of simultaneous DB queries, else they serialize on "
+                "pool.acquire(). Raise pg_pool_max_size or lower worker_concurrency.")
+        # C1: гейт порядка не должен «сдаваться» раньше, чем зависший в PEL предшественник
+        # успеет реклеймнуться (reclaim_min_idle_ms) И догенерироваться (ещё один lock_ttl).
+        # Иначе преемник перешагнёт разрыв, а реальное сообщение потом отсеётся как дубль.
+        min_gap = self.reclaim_min_idle_ms + self.conv_lock_ttl_seconds * 1000
+        if self.order_gap_timeout_ms <= min_gap:
+            raise ValueError(
+                "order_gap_timeout_ms must be > reclaim_min_idle_ms + "
+                "conv_lock_ttl_seconds*1000 (C1): give a stuck predecessor time to be "
+                "reclaimed and regenerated before the gate declares it lost, otherwise "
+                "a transient worker/LLM failure permanently drops that turn.")
         return self
 
     @model_validator(mode="after")

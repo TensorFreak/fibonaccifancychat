@@ -19,7 +19,14 @@ services:
 
   redis:
     image: redis:7
-    ports: ["6379:6379"]
+    # ПЕРСИСТЕНТНОСТЬ (C2): Redis здесь — durable-очередь принятых сообщений (chat:inbound)
+    # и источник истины порядка (seq/applied), поэтому его нельзя держать в памяти. AOF с
+    # fsync раз в секунду + том переживают рестарт/пересоздание контейнера. Без этого
+    # рестарт Redis терял бы принятые, но ещё не сохранённые в Postgres сообщения.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redisdata:/data
+    # Порт наружу НЕ публикуем: доступ только из внутренней сети compose (api/воркеры).
 
   # Одноразовый шаг: применяет миграции БД и завершается. Схема больше НЕ грузится
   # через initdb — источник истины схемы это migrations/ (см. app/migrate.py).
@@ -37,17 +44,38 @@ services:
   # тогда страница на https:// автоматически откроет wss:// (см. chat.html).
   api:
     build: .
-    # --proxy-headers: за reverse-proxy доверяем X-Forwarded-* (правильные scheme/IP).
-    command: ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000",
-              "--proxy-headers", "--forwarded-allow-ips", "*"]
+    # --proxy-headers + --forwarded-allow-ips: доверяем X-Forwarded-* ТОЛЬКО от reverse-proxy
+    # (H3). Раньше стояло "*" — любой клиент мог подделать scheme/IP. Теперь api слушает
+    # только во внутренней сети (порт наружу не публикуется), а X-Forwarded принимаем от
+    # доверенной подсети docker. FORWARDED_ALLOW_IPS настраивается в .env (CIDR прокси).
+    command: ["sh", "-c",
+              "uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-172.16.0.0/12}\""]
     env_file: .env
-    ports: ["8000:8000"]
+    # Порт наружу НЕ публикуется: TLS-терминация и вход — через caddy (см. ниже).
+    expose: ["8000"]
     depends_on:
       redis:
         condition: service_started
       migrate:
         condition: service_completed_successfully
-    # Масштабирование api за прокси (фикс. host-порт снять): --scale api=3
+    # Масштабирование api за прокси: --scale api=3 (caddy балансирует по DNS-имени api)
+
+  # TLS-терминация и единая точка входа (H3). Автоматический HTTPS, если в .env задан
+  # домен (SITE_ADDRESS=chat.example.com). По умолчанию ":80" — просто HTTP на localhost
+  # для запуска «из коробки». Раньше api торчал наружу открытым портом без TLS: токены
+  # ходили бы по plaintext (тем более что ws-токен в URL).
+  caddy:
+    image: caddy:2
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+      - caddyconfig:/config
+    depends_on:
+      api:
+        condition: service_started
 
   # Исполнитель №2: LLM-воркер. Consumer group, ходит к модели, пишет в Postgres.
   worker:
@@ -75,3 +103,6 @@ services:
 
 volumes:
   pgdata:
+  redisdata:
+  caddydata:
+  caddyconfig:

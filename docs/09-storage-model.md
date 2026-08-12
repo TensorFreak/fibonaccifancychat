@@ -49,7 +49,8 @@ idx_messages_dedup   ON messages (message_id, role) WHERE message_id IS NOT NULL
 
 ## Слой доступа: `app/db.py`
 
-Async через `asyncpg`, пул соединений (`min_size=1, max_size=10`) с таймаутами запросов
+Async через `asyncpg`, пул соединений (`pg_pool_min_size`/`pg_pool_max_size`, дефолт 1/32,
+`>= worker_concurrency` — H1) с таймаутами запросов
 (`command_timeout` + серверный `statement_timeout`) — зависший запрос не держит соединение
 вечно (см. [10. Харденинг](10-hardening.md), R3-M3).
 

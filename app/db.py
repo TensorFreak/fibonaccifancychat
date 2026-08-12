@@ -19,7 +19,8 @@ async def get_pool() -> asyncpg.Pool:
         # (server_settings) — серверный предел, отменяет запрос на стороне БД. Без них
         # зависший запрос держал бы соединение из пула бесконечно -> исчерпание пула.
         _pool = await asyncpg.create_pool(
-            settings.postgres_dsn, min_size=1, max_size=10,
+            settings.postgres_dsn,
+            min_size=settings.pg_pool_min_size, max_size=settings.pg_pool_max_size,
             command_timeout=settings.pg_command_timeout,
             server_settings={"statement_timeout": str(settings.pg_statement_timeout_ms)},
         )

@@ -63,6 +63,20 @@ def ws_rate(user_id: str, window: int) -> str:
     return f"rl:ws:{user_id}:{window}"
 
 
+def ws_conns(user_id: str) -> str:
+    # Redis счётчик ОДНОВРЕМЕННЫХ ws-соединений пользователя (H2). INCR при коннекте,
+    # DECR при обрыве; общий на все инстансы api. Safety-TTL страхует от утечки счётчика,
+    # если инстанс api умер, не сделав DECR.
+    return f"ws:conns:{user_id}"
+
+
+def order_loss_stream(inbound_stream: str) -> str:
+    # Redis STREAM аудита событий потери хода в FIFO-гейте (C3): каждый пропуск разрыва
+    # по order_gap_timeout пишется сюда для алертинга/разбора. Разбирать:
+    # `XRANGE <inbound>:order_loss - +`.
+    return f"{inbound_stream}:order_loss"
+
+
 def conv_applied(conversation_id: str) -> str:
     # Redis STRING: номер последнего УЖЕ применённого сообщения диалога.
     # Гейт порядка: обрабатываем только seq == applied + 1.

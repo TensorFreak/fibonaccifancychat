@@ -180,7 +180,7 @@ if seq: await _mark_applied(r, conversation_id, seq)
 
 | Параметр | Значение | Где влияет |
 |---|---|---|
-| `worker_concurrency` | 32 | сколько генераций РАЗНЫХ диалогов процесс ведёт одновременно (R6-1) |
+| `worker_concurrency` | 24 | сколько генераций РАЗНЫХ диалогов процесс ведёт одновременно (R6-1); `<= pg_pool_max_size` (H1) |
 | `conv_lock_ttl_seconds` | 300 c (+heartbeat) | TTL замка диалога; продлевается во время генерации |
 | `summary_trigger_messages` | 20 | порог запуска суммаризации |
 | `gen_ttl_seconds` / `gen_active_ttl_seconds` | 300 / 900 | жизнь ленты генерации после `end` / во время |

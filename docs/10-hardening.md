@@ -434,7 +434,7 @@ LLM (event loop простаивает), поэтому это ровно ант
 процесс — свой пул до 10 соединений; ~10 воркеров исчерпывают дефолтный `max_connections=100`).
 
 **Стало:** цикл раздаёт сообщения фоновым задачам (`_process_and_ack` через `_dispatch`),
-удерживая не больше `worker_concurrency` (дефолт 32) одновременно:
+удерживая не больше `worker_concurrency` (дефолт 24) одновременно:
 - читаем из группы ровно `worker_concurrency − len(inflight)` сообщений (`count=available`),
   чтобы не захватывать в свой PEL больше, чем ведём (иначе задачи копились бы, а
   простаивающие воркеры не могли бы их взять);
@@ -498,7 +498,9 @@ fake-Redis):
 
 | Параметр | Значение | Назначение |
 |---|---|---|
-| `worker_concurrency` | 32 | параллельных генераций РАЗНЫХ диалогов на процесс (R6-1); валидатор `>= 1` |
+| `worker_concurrency` | 24 | параллельных генераций РАЗНЫХ диалогов на процесс (R6-1); валидатор `>= 1` и `<= pg_pool_max_size` (H1) |
+| `pg_pool_min_size` / `pg_pool_max_size` | 1 / 32 | пул asyncpg на процесс; должен покрывать пик одновременных запросов = `worker_concurrency` (H1) |
+| `ws_max_connections_per_user` | 20 | потолок одновременных ws-соединений на пользователя, проверка ДО БД (H2) |
 | `auth_dev_mode` | **false** | dev-авторизация ВЫКЛ по умолчанию (fail-closed, R2-1) |
 | `max_message_chars` | 8000 | лимит длины входящего сообщения |
 | `ws_rate_max_messages` / `ws_rate_window_seconds` | 30 / 10 | per-user рейтлимит ws-сообщений (R2-4) |
@@ -515,7 +517,7 @@ fake-Redis):
 | `context_window_tokens` | 256000 | окно модели (переименовано с `model_context_window`) |
 | `inbound_stream_maxlen` / `summarize_stream_maxlen` | 100000 / 50000 | потолок длины стримов |
 | `conv_lock_ttl_seconds` / `lock_heartbeat_seconds` | 300 / 30 | TTL замка + период heartbeat |
-| `order_gap_timeout_ms` | 120000 | таймаут liveness FIFO-гейта (консервативно, R2-5) |
+| `order_gap_timeout_ms` | 900000 | таймаут liveness FIFO-гейта; валидатор требует `> reclaim_min_idle_ms + conv_lock_ttl*1000` (C1), потеря хода дублируется в поток `chat:inbound:order_loss` (C3) |
 | `summary_max_fetch` | 5000 | потолок вычитки на заход суммаризации |
 | `llm_connect_timeout` / `llm_read_timeout` / `llm_write_timeout` | 10 / 120 / 30 c | таймауты LLM |
 
