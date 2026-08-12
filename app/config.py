@@ -417,6 +417,16 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
+        # Игнорируем лишние ключи (native-run fix). .env содержит compose-only переменные
+        # (POSTGRES_USER/PASSWORD/DB, SITE_ADDRESS, FORWARDED_ALLOW_IPS — их читает
+        # docker-compose, не приложение). При запуске В КОНТЕЙНЕРЕ их нет во внимании
+        # pydantic (файл .env в образ не копируется, переменные приходят окружением, а
+        # лишние env-переменные игнорируются по умолчанию). Но при НАТИВНОМ запуске из
+        # корня репозитория (uvicorn/pytest с .env рядом) DotEnv-источник прочитал бы весь
+        # файл и без этого упал бы на лишних ключах (extra=forbid по умолчанию). Ставим
+        # ignore, чтобы локальный запуск работал и добавление новых compose-переменных не
+        # ломало старт.
+        extra = "ignore"
 
 
 settings = Settings()
