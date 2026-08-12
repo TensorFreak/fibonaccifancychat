@@ -64,9 +64,12 @@ def ws_rate(user_id: str, window: int) -> str:
 
 
 def ws_conns(user_id: str) -> str:
-    # Redis счётчик ОДНОВРЕМЕННЫХ ws-соединений пользователя (H2). INCR при коннекте,
-    # DECR при обрыве; общий на все инстансы api. Safety-TTL страхует от утечки счётчика,
-    # если инстанс api умер, не сделав DECR.
+    # Redis ZSET ОДНОВРЕМЕННЫХ ws-соединений пользователя (H2): member = id соединения,
+    # score = время протухания. ZADD при коннекте, ZREM при обрыве, heartbeat продлевает
+    # score живого соединения; на входе выкидываем протухшие члены (ZREMRANGEBYSCORE) и
+    # считаем живые (ZCARD). Общий на все инстансы api. В отличие от прежнего INCR/DECR
+    # счётчика это НЕ уходит в минус и НЕ теряет учёт долгоживущих сокетов: запись мёртвого
+    # инстанса сама выпадает по score.
     return f"ws:conns:{user_id}"
 
 
@@ -75,6 +78,14 @@ def order_loss_stream(inbound_stream: str) -> str:
     # по order_gap_timeout пишется сюда для алертинга/разбора. Разбирать:
     # `XRANGE <inbound>:order_loss - +`.
     return f"{inbound_stream}:order_loss"
+
+
+def summary_lag_stream(summarize_stream: str) -> str:
+    # Redis STREAM аудита отставания суммаризации (H2): если несвёрнутый хвост уже длиннее
+    # горячего окна, часть сообщений выпала из окна, но ещё НЕ попала в summary -> дыра в
+    # контексте. Пишем сюда (как order_loss), чтобы завести алерт, а не терять молча.
+    # Разбирать: `XRANGE <summarize>:lag - +`.
+    return f"{summarize_stream}:lag"
 
 
 def conv_applied(conversation_id: str) -> str:

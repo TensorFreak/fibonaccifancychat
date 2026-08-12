@@ -4,15 +4,20 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: app
-      POSTGRES_PASSWORD: app
-      POSTGRES_DB: chat
-    ports: ["5432:5432"]
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      POSTGRES_DB: ${POSTGRES_DB:-chat}
+    # Порт наружу НЕ публикуем (C1): Postgres — source of truth (юзеры, ХЕШИ ПАРОЛЕЙ, вся
+    # история диалогов). Доступ только из внутренней сети compose (api/воркеры/migrate),
+    # как и у redis. Раньше стояло ports:["5432:5432"] — на сервере с публичным IP это
+    # открывало БД наружу под учёткой из .env (по умолчанию app/app). Для локальной отладки
+    # при НЕОБХОДИМОСТИ раскомментируйте, привязав ТОЛЬКО к localhost:
+    #   ports: ["127.0.0.1:5432:5432"]
     volumes:
       - pgdata:/var/lib/postgresql/data
     # healthcheck: миграции и приложение ждут, пока БД реально примет соединения.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d chat"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app} -d ${POSTGRES_DB:-chat}"]
       interval: 3s
       timeout: 3s
       retries: 20

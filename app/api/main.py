@@ -207,6 +207,38 @@ async def page_chat():
     return FileResponse(_STATIC / "chat.html")
 
 
+async def _register_ws_conn(r, user_id: str, conn_id: str) -> int:
+    """Учёт ОДНОВРЕМЕННЫХ ws-соединений пользователя как ZSET дедлайнов (H2). Возвращает
+    число живых соединений ПОСЛЕ добавления себя.
+
+    Каждое соединение — член ZSET со score = временем протухания. На входе выкидываем
+    протухшие записи (мёртвые инстансы, не снявшие свой член), добавляем себя и считаем.
+    В отличие от прежнего INCR/DECR со счётчиком под коротким TTL это НЕ уходит в минус и
+    НЕ теряет учёт для долгоживущих сокетов: запись мёртвого инстанса выпадает по score,
+    а живое соединение продлевает свой дедлайн heartbeat'ом (_ws_conn_heartbeat)."""
+    key = keys.ws_conns(user_id)
+    now = time.time()
+    ttl = settings.ws_conn_ttl_seconds
+    await r.zremrangebyscore(key, "-inf", now)          # выкинуть протухшие записи
+    await r.zadd(key, {conn_id: now + ttl})             # наш дедлайн
+    n = await r.zcard(key)
+    await r.expire(key, ttl)                            # весь набор протухнет при простое
+    return n
+
+
+async def _ws_conn_heartbeat(r, user_id: str, conn_id: str):
+    """Продлевать дедлайн своей записи в ZSET учёта, пока сокет жив (H2). Без этого запись
+    протухла бы по score под живым, но долгим соединением, и учёт занизил бы число сокетов."""
+    key = keys.ws_conns(user_id)
+    while True:
+        await asyncio.sleep(settings.lock_heartbeat_seconds)
+        try:
+            await r.zadd(key, {conn_id: time.time() + settings.ws_conn_ttl_seconds})
+            await r.expire(key, settings.ws_conn_ttl_seconds)
+        except Exception:
+            pass                                       # моргание Redis не должно рвать сокет
+
+
 async def _allow_ws_message(r, user_id: str) -> bool:
     """Рейтлимит входящих ws-сообщений per-user, фиксированное окно (H2).
 
@@ -295,14 +327,14 @@ async def ws_endpoint(ws: WebSocket, conversation_id: str):
         return
     # ПОТОЛОК ОДНОВРЕМЕННЫХ СОЕДИНЕНИЙ на пользователя (H2): проверяем ДО обращения к БД,
     # чтобы флуд коннектов одним токеном не хаммерил Postgres (ensure_conversation —
-    # транзакция на каждый коннект). INCR общий на все инстансы; safety-TTL страхует от
-    # утечки счётчика, если инстанс умер без DECR. release_conn() снимает слот на ЛЮБОМ
-    # выходе (ровно один раз).
+    # транзакция на каждый коннект). Учёт — ZSET дедлайнов, общий на все инстансы (см.
+    # _register_ws_conn): запись мёртвого инстанса выпадает по score, живое соединение
+    # продлевает свою heartbeat'ом. release_conn() снимает слот на ЛЮБОМ выходе (ровно раз).
+    conn_id = uuid.uuid4().hex
     conn_key = keys.ws_conns(user_id)
     conn_counted = False
     try:
-        n_conns = await r.incr(conn_key)
-        await r.expire(conn_key, settings.conv_lock_ttl_seconds * 2)
+        n_conns = await _register_ws_conn(r, user_id, conn_id)
         conn_counted = True
     except Exception:
         n_conns = 1                        # Redis моргнул — не блокируем вход из-за учёта
@@ -312,9 +344,9 @@ async def ws_endpoint(ws: WebSocket, conversation_id: str):
         if conn_counted:
             conn_counted = False
             try:
-                await r.decr(conn_key)
+                await r.zrem(conn_key, conn_id)
             except Exception:
-                pass                       # safety-TTL уберёт счётчик, если DECR не прошёл
+                pass                       # запись сама протухнет по score, если ZREM не прошёл
 
     if n_conns > settings.ws_max_connections_per_user:
         await release_conn()
@@ -392,6 +424,8 @@ async def ws_endpoint(ws: WebSocket, conversation_id: str):
                 await asyncio.sleep(1.0)                # пауза перед повторным XREAD
 
     out_task = asyncio.create_task(pump_out(last_event_id))
+    # Продлеваем учётную запись этого соединения, пока сокет жив (H2).
+    hb_task = asyncio.create_task(_ws_conn_heartbeat(r, user_id, conn_id))
 
     try:
         # --- ВХОДНОЙ цикл: сокет -> Redis Stream ---
@@ -454,6 +488,7 @@ async def ws_endpoint(ws: WebSocket, conversation_id: str):
         pass
     finally:
         out_task.cancel()
+        hb_task.cancel()
         for t in tasks:
             t.cancel()
         await release_conn()               # освободить слот соединения пользователя (H2)

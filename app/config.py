@@ -136,6 +136,14 @@ class Settings(BaseSettings):
     # Redis (общий на все инстансы api), проверяем ДО обращения к БД. Значение щедрое для
     # человека с несколькими вкладками/устройствами, но режет флуд соединений.
     ws_max_connections_per_user: int = 20
+    # TTL «свежести» записи о ws-соединении в учётном ZSET (H2). Каждое ЖИВОЕ соединение
+    # продлевает свой дедлайн heartbeat'ом раз в lock_heartbeat_seconds; запись мёртвого
+    # инстанса (не снявшего свой член) сама выпадает из счёта по истечении этого срока.
+    # Это заменяет прежний INCR/DECR-счётчик под коротким TTL, который для ДОЛГОживущих
+    # сокетов протухал на лету и уходил в минус (лимит переставал работать). Должен быть
+    # заметно больше lock_heartbeat_seconds (валидатор требует), иначе живое соединение
+    # выпадет между продлениями и учёт начнёт врать.
+    ws_conn_ttl_seconds: int = 90
 
     # Максимальная длина пароля (bcrypt режет на 72 байтах и кидает на длинных).
     password_max_chars: int = 128
@@ -285,6 +293,11 @@ class Settings(BaseSettings):
                 "(don't reclaim a task before a dead worker's lock would expire)")
         if self.worker_concurrency < 1:
             raise ValueError("worker_concurrency must be >= 1")
+        if self.ws_conn_ttl_seconds <= self.lock_heartbeat_seconds:
+            raise ValueError(
+                "ws_conn_ttl_seconds must be > lock_heartbeat_seconds (H2): a live "
+                "connection refreshes its accounting entry every lock_heartbeat_seconds; "
+                "a shorter TTL drops it between refreshes and the per-user cap drifts.")
         if self.worker_concurrency > self.pg_pool_max_size:
             raise ValueError(
                 "worker_concurrency must be <= pg_pool_max_size (H1): the pool must "

@@ -99,6 +99,29 @@ async def summarize(r, conversation_id: str):
         pending = await db.load_messages_since(
             conversation_id, upto_id, settings.summary_max_fetch)
         capped = len(pending) >= settings.summary_max_fetch
+
+        # АЛЕРТ на «дыру» в контексте (H2). ИНВАРИАНТ отсутствия дыры: горячее окно
+        # (ctx_max_messages) должно вмещать ВСЁ ещё не свёрнутое в summary. Если
+        # несвёрнутый хвост стал ДЛИННЕЕ окна — часть сообщений уже выпала из окна, но
+        # ещё не попала в summary, и промпт между суммаризациями теряет середину диалога.
+        # В норме since_sum-триггер держит хвост ~= окну; длинный хвост = суммаризатор
+        # отставал/падал (в т.ч. dead-letter). Свёртка ниже это ВЫЛЕЧИТ (сдвинет
+        # watermark), но факт отставания фиксируем в durable-аудит для алерта — иначе
+        # деградация контекста была бы молчаливой.
+        if len(pending) > settings.ctx_max_messages:
+            log.warning("[summary][LAG] conv=%s: %d unsummarized messages exceed hot "
+                        "window (%d) — context hole possible until fold catches up",
+                        conversation_id, len(pending), settings.ctx_max_messages)
+            try:
+                await r.xadd(keys.summary_lag_stream(settings.summarize_stream),
+                             {"conversation_id": conversation_id,
+                              "pending": str(len(pending)),
+                              "window": str(settings.ctx_max_messages)},
+                             maxlen=settings.dead_letter_maxlen, approximate=True)
+            except Exception as e:                   # аудит не должен ломать суммаризацию
+                log.warning("summary lag audit xadd failed conv=%s: %r",
+                            conversation_id, e)
+
         # последние N оставляем дословно в окне — не сворачиваем
         to_fold = pending[:-settings.summary_recent_keep] if \
             len(pending) > settings.summary_recent_keep else []
