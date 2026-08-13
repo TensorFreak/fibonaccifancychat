@@ -57,6 +57,51 @@ async def test_llm_title_used_and_cleaned_when_present(monkeypatch):
     assert captured["title"] == "Чехов: жизнь и творчество"   # первая строка, кавычки сняты
 
 
+async def test_strips_think_block_and_takes_title(monkeypatch):
+    """Гибридная модель встроила reasoning в content (<think>…</think>) — заголовок идёт
+    после; извлекаем чистое название, а не строку размышления."""
+    captured = {}
+
+    async def fake_first(conversation_id):
+        return "любой вопрос"
+
+    async def fake_complete(prompt, max_tokens=None):
+        return "<think>Пользователь спрашивает про Чехова, дам короткое имя</think>\nАнтон Чехов"
+
+    async def fake_set(conversation_id, title):
+        captured["title"] = title
+
+    monkeypatch.setattr(db, "get_first_user_message", fake_first)
+    monkeypatch.setattr(s, "complete", fake_complete)
+    monkeypatch.setattr(db, "set_conversation_title", fake_set)
+
+    await s.generate_title(None, "cid")
+    assert captured["title"] == "Антон Чехов"
+
+
+async def test_dangling_unclosed_think_falls_back(monkeypatch):
+    """Незакрытый <think> (ответ обрезан по лимиту токенов) => видимого заголовка нет =>
+    фолбэк на первое сообщение, а НЕ «<think>…» как заголовок."""
+    captured = {}
+
+    async def fake_first(conversation_id):
+        return "Расскажи про Чехова"
+
+    async def fake_complete(prompt, max_tokens=None):
+        return "<think>Так, надо придумать короткое название для диалога про"
+
+    async def fake_set(conversation_id, title):
+        captured["title"] = title
+
+    monkeypatch.setattr(db, "get_first_user_message", fake_first)
+    monkeypatch.setattr(s, "complete", fake_complete)
+    monkeypatch.setattr(db, "set_conversation_title", fake_set)
+
+    await s.generate_title(None, "cid")
+    assert "<think" not in captured["title"]
+    assert "Чехов" in captured["title"]
+
+
 async def test_no_title_written_when_no_user_message(monkeypatch):
     """Если сообщений пользователя нет — вообще ничего не пишем (не «Новый чат»)."""
     called = {"set": False}

@@ -11,6 +11,7 @@
 """
 import asyncio
 import os
+import re
 import signal
 import socket
 import uuid
@@ -171,14 +172,22 @@ async def generate_title(r, conversation_id: str):
         {"role": "user", "content": first[:2000]},
     ]
     raw = (await complete(prompt, max_tokens=settings.title_max_tokens)).strip()
-    title = raw.splitlines()[0].strip().strip('"').strip("«»").strip() if raw else ""
-    # ФОЛБЭК на первое сообщение пользователя, если модель вернула ПУСТО (частое для
-    # reasoning-моделей при малом max_tokens: весь бюджет уходит в reasoning_content, а
-    # content пустой). НЕ пишем строку-заглушку «Новый чат»: в UI она неотличима от «без
-    # названия», но при этом НЕПУСТАЯ — поэтому навсегда блокирует и перегенерацию
+    # Срезаем reasoning-разметку, если гибридная модель (напр. deepseek-v4) встроила «мысли»
+    # в content: заголовок идёт ПОСЛЕ <think>…</think>. Закрытые блоки вырезаем; висящий
+    # незакрытый (ответ обрезан по лимиту токенов) отбрасываем до конца строки.
+    cleaned = re.sub(r"<think.*?</think>", "", raw, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<think.*", "", cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
+    lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+    title = lines[0].strip('"').strip("«»").strip() if lines else ""
+    # ФОЛБЭК, если модель не дала заголовок (частая причина — reasoning съел весь бюджет
+    # токенов, видимый content пуст). НЕ пишем строку-заглушку «Новый чат»: в UI она
+    # неотличима от «без названия», но НЕПУСТАЯ — поэтому навсегда блокирует и перегенерацию
     # (set_conversation_title пишет лишь WHERE title IS NULL), и повторную постановку задачи
-    # (NX-маркер живёт сутки). Обрезанный вопрос — осмысленное детерминированное имя.
+    # (NX-маркер живёт сутки). Логируем СЫРОЙ ответ модели, чтобы было видно, что она вернула
+    # (пусто -> мало токенов на titul; текст -> проблема парсинга), и берём осмысленное имя
+    # из первого сообщения пользователя.
     if not title:
+        log.warning("empty title conv=%s, raw LLM output=%r", conversation_id, raw)
         title = " ".join(first.split())[:60]
     await db.set_conversation_title(conversation_id, title[:120])
 
