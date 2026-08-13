@@ -177,7 +177,21 @@ async function refreshTitles(){
     if(changed){ renderSidebar(); if(activeId && byId[activeId]) $("title").textContent = byId[activeId] || "Новый чат"; }
   }catch(e){}
 }
-function scheduleTitleRefresh(){ setTimeout(refreshTitles, 1800); setTimeout(refreshTitles, 4500); }
+// Название генерится ОТДЕЛЬНЫМ LLM-вызовом в суммаризаторе и может быть готово позже
+// пары секунд (очередь занята / модель отвечает дольше). Поэтому опрашиваем с нарастающей
+// паузой, ПОКА у активного чата не появится заголовок, а не два раза по фиксированному
+// таймеру (иначе UI переставал ждать через 4.5с и заголовок не подхватывался до reload).
+// Останавливаемся, как только заголовок пришёл, или после исчерпания попыток (~32с).
+function scheduleTitleRefresh(){
+  const delays = [1200, 2000, 3000, 5000, 8000, 13000];
+  let i = 0;
+  const tick = async () => {
+    await refreshTitles();
+    const it = items.find(x => x.id === activeId);
+    if(i < delays.length && (!it || !it.title)) setTimeout(tick, delays[i++]);
+  };
+  setTimeout(tick, delays[i++]);
+}
 
 async function newChat(){
   const {id} = await api("/api/conversations", {method:"POST"});
