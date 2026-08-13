@@ -24,14 +24,17 @@ def _get_client() -> httpx.AsyncClient:
     return _client
 
 
-async def stream_completion(messages: list[dict], max_tokens: int | None = None):
+async def stream_completion(messages: list[dict], max_tokens: int | None = None,
+                            model: str | None = None):
     """Отправляет контекст в модель и отдаёт токены по мере генерации.
     messages: [{'role': 'user'|'assistant'|'system', 'content': str}, ...]
     max_tokens: жёсткий потолок ответа. None -> settings.max_response_tokens.
     Всегда задаём его: без max_tokens длина ответа не ограничена (стоимость,
-    латентность, риск упереться в контекст на длинных диалогах)."""
+    латентность, риск упереться в контекст на длинных диалогах).
+    model: переопределение модели (None -> settings.llm_model). Нужно, напр., чтобы
+    авто-название делать отдельной НЕ-reasoning моделью (см. title_llm_model)."""
     payload = {
-        "model": settings.llm_model,
+        "model": model or settings.llm_model,
         "messages": messages,
         "stream": True,
         "max_tokens": max_tokens or settings.max_response_tokens,
@@ -57,9 +60,11 @@ async def stream_completion(messages: list[dict], max_tokens: int | None = None)
                 yield delta
 
 
-async def complete(messages: list[dict], max_tokens: int | None = None) -> str:
+async def complete(messages: list[dict], max_tokens: int | None = None,
+                   model: str | None = None) -> str:
     """Нестриминговый вызов: собираем весь ответ в строку.
     Нужен суммаризатору — ему стриминг токенов не нужен, нужен готовый текст.
-    max_tokens пробрасывается, чтобы ограничить объём резюме."""
-    parts = [token async for token in stream_completion(messages, max_tokens)]
+    max_tokens пробрасывается, чтобы ограничить объём резюме; model — чтобы
+    делать заголовок отдельной моделью (см. title_llm_model)."""
+    parts = [token async for token in stream_completion(messages, max_tokens, model)]
     return "".join(parts)

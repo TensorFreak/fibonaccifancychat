@@ -171,7 +171,10 @@ async def generate_title(r, conversation_id: str):
                     "кавычек и без точки в конце."},
         {"role": "user", "content": first[:2000]},
     ]
-    raw = (await complete(prompt, max_tokens=settings.title_max_tokens)).strip()
+    # Заголовок можно делать ОТДЕЛЬНОЙ моделью (title_llm_model): если основная —
+    # reasoning, она отдаёт пустой content на короткий бюджет. Пусто -> основная модель.
+    raw = (await complete(prompt, max_tokens=settings.title_max_tokens,
+                          model=settings.title_llm_model or None)).strip()
     # Срезаем reasoning-разметку, если гибридная модель (напр. deepseek-v4) встроила «мысли»
     # в content: заголовок идёт ПОСЛЕ <think>…</think>. Закрытые блоки вырезаем; висящий
     # незакрытый (ответ обрезан по лимиту токенов) отбрасываем до конца строки.

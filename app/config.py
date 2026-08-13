@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     llm_api_url: str = "https://api.openai.com/v1/chat/completions"
     llm_api_key: str = ""
     llm_model: str = "gpt-4o-mini"
+    # Модель для АВТО-НАЗВАНИЯ диалога. Пусто -> берётся llm_model. Полезно, когда основная
+    # модель — reasoning (напр. deepseek-v4): она тратит весь бюджет заголовка на скрытое
+    # размышление и отдаёт пустой content -> заголовок падает в фолбэк. Укажите тут дешёвую
+    # НЕ-reasoning модель (напр. deepseek/deepseek-chat) — заголовки будут быстрыми и живыми.
+    title_llm_model: str = ""
 
     # горячий контекст в Redis
     ctx_ttl_seconds: int = 1800      # 30 мин неактивности -> контекст протухает

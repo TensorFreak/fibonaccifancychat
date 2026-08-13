@@ -10,7 +10,31 @@ max_tokens — бюджет уходит в reasoning_content, content пуст�
 Фикс: при пустом ответе LLM берём осмысленное имя из первого сообщения пользователя.
 """
 from app import db
+from app.config import settings
 from app.workers import summarizer as s
+
+
+async def test_title_uses_dedicated_title_model_when_set(monkeypatch):
+    """title_llm_model задан -> заголовок генерится ИМ, а не основной llm_model."""
+    monkeypatch.setattr(settings, "title_llm_model", "provider/non-reasoning-mini")
+    captured = {}
+
+    async def fake_first(conversation_id):
+        return "вопрос"
+
+    async def fake_complete(prompt, max_tokens=None, model=None):
+        captured["model"] = model
+        return "Заголовок"
+
+    async def fake_set(conversation_id, title):
+        pass
+
+    monkeypatch.setattr(db, "get_first_user_message", fake_first)
+    monkeypatch.setattr(s, "complete", fake_complete)
+    monkeypatch.setattr(db, "set_conversation_title", fake_set)
+
+    await s.generate_title(None, "cid")
+    assert captured["model"] == "provider/non-reasoning-mini"
 
 
 async def test_empty_llm_title_falls_back_to_first_message(monkeypatch):
@@ -19,7 +43,7 @@ async def test_empty_llm_title_falls_back_to_first_message(monkeypatch):
     async def fake_first(conversation_id):
         return "Расскажи подробно про Чехова и его пьесы"
 
-    async def fake_complete(prompt, max_tokens=None):
+    async def fake_complete(prompt, max_tokens=None, model=None):
         return "   "                                   # модель вернула пусто/пробелы
 
     async def fake_set(conversation_id, title):
@@ -42,7 +66,7 @@ async def test_llm_title_used_and_cleaned_when_present(monkeypatch):
     async def fake_first(conversation_id):
         return "любой вопрос"
 
-    async def fake_complete(prompt, max_tokens=None):
+    async def fake_complete(prompt, max_tokens=None, model=None):
         return '«Чехов: жизнь и творчество»\nлишняя строка'   # кавычки + перевод строки
 
     async def fake_set(conversation_id, title):
@@ -65,7 +89,7 @@ async def test_strips_think_block_and_takes_title(monkeypatch):
     async def fake_first(conversation_id):
         return "любой вопрос"
 
-    async def fake_complete(prompt, max_tokens=None):
+    async def fake_complete(prompt, max_tokens=None, model=None):
         return "<think>Пользователь спрашивает про Чехова, дам короткое имя</think>\nАнтон Чехов"
 
     async def fake_set(conversation_id, title):
@@ -87,7 +111,7 @@ async def test_dangling_unclosed_think_falls_back(monkeypatch):
     async def fake_first(conversation_id):
         return "Расскажи про Чехова"
 
-    async def fake_complete(prompt, max_tokens=None):
+    async def fake_complete(prompt, max_tokens=None, model=None):
         return "<think>Так, надо придумать короткое название для диалога про"
 
     async def fake_set(conversation_id, title):
