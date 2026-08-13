@@ -172,7 +172,15 @@ async def generate_title(r, conversation_id: str):
     ]
     raw = (await complete(prompt, max_tokens=settings.title_max_tokens)).strip()
     title = raw.splitlines()[0].strip().strip('"').strip("«»").strip() if raw else ""
-    await db.set_conversation_title(conversation_id, (title or "Новый чат")[:120])
+    # ФОЛБЭК на первое сообщение пользователя, если модель вернула ПУСТО (частое для
+    # reasoning-моделей при малом max_tokens: весь бюджет уходит в reasoning_content, а
+    # content пустой). НЕ пишем строку-заглушку «Новый чат»: в UI она неотличима от «без
+    # названия», но при этом НЕПУСТАЯ — поэтому навсегда блокирует и перегенерацию
+    # (set_conversation_title пишет лишь WHERE title IS NULL), и повторную постановку задачи
+    # (NX-маркер живёт сутки). Обрезанный вопрос — осмысленное детерминированное имя.
+    if not title:
+        title = " ".join(first.split())[:60]
+    await db.set_conversation_title(conversation_id, title[:120])
 
 
 async def handle(r, fields: dict):
