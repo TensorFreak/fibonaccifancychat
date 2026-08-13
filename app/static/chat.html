@@ -202,7 +202,16 @@ async function newChat(){
 $("newBtn").onclick = newChat;
 $("burger").onclick = () => $("sidebar").classList.toggle("open");
 
+// Полностью гасим текущий сокет: снимаем ВСЕ обработчики (иначе onmessage старого чата
+// продолжит писать в общий лог/bubbles) и закрываем. Вызывается при переключении чата.
+function teardownWs(){
+  if(ws){ ws.onopen = ws.onclose = ws.onmessage = ws.onerror = null; try{ ws.close(); }catch(e){} ws = null; }
+}
 async function selectChat(id){
+  // КРИТИЧНО (изоляция чатов): гасим сокет прежнего чата СРАЗУ, до await loadHistory.
+  // Иначе он остаётся открытым всё время запроса истории и рендерит свои токены в новый
+  // чат (утечка стрима между диалогами).
+  teardownWs();
   activeId = id;
   const it = items.find(x => x.id===id);
   $("title").textContent = (it && it.title) || "Новый чат";
@@ -267,7 +276,7 @@ async function reconnect(id){
   if(activeId === id) connect(id);
 }
 function connect(id){
-  if(ws){ ws.onclose = null; ws.close(); }
+  teardownWs();   // снять ВСЕ обработчики старого сокета (не только onclose), затем открыть новый
   const proto = location.protocol === "https:" ? "wss" : "ws";
   // last_event_id: догон событий строго после последнего применённого (снапшот истории
   // при первом коннекте, последнее виденное событие — при авто-реконнекте).
@@ -291,6 +300,10 @@ function connect(id){
     setTimeout(()=>{ reconnect(id); }, delay);   // авто-реконнект с ресинком (M1-review)
   };
   ws.onmessage = (ev) => {
+    // КРИТИЧНО (изоляция чатов): рендерим ТОЛЬКО сообщения сокета текущего активного чата.
+    // id захвачен в этом connect(); если пользователь уже переключился (activeId сменился),
+    // отбрасываем — иначе стриминг ушедшего диалога попал бы в открытый сейчас (утечка).
+    if(id !== activeId) return;
     const e = JSON.parse(ev.data);
     if(e.eid) lastEventId = e.eid;   // событие ленты -> двигаем курсор догона
     if(e.type === "user_message"){
