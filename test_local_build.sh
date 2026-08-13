@@ -8,9 +8,18 @@
 #   3) поднимает docker compose, ждёт готовности и печатает URL для входа.
 #
 # Использование:
-#   ./test_local_build.sh                       # первый запуск: свежий .env + чистый старт
+#   ./test_local_build.sh                       # локально: свежий .env + чистый старт (http://localhost)
 #   ./test_local_build.sh --fresh               # пересоздать секреты И стереть тома БД
 #   LLM_API_KEY=sk-... ./test_local_build.sh    # сразу подставить ключ LLM (без вопроса)
+#
+# ПУБЛИЧНЫЙ доступ (коллеги заходят с других машин):
+#   ./test_local_build.sh --public chat.example.com   # свой домен → HTTPS (Let's Encrypt)
+#   ./test_local_build.sh --public-ip 203.0.113.5     # БЕЗ домена → HTTPS через <ip>.sslip.io
+#   (просто HTTP по IP без шифрования: не задавайте флаг, оставьте SITE_ADDRESS=:80 и
+#    откройте порт 80 — но пароли/токены пойдут открытым текстом, только для «на 5 минут»)
+# Флаги комбинируются: ./test_local_build.sh --fresh --public-ip 203.0.113.5
+# ВАЖНО (сервер): порты 80 и 443 нужно открыть в firewall/security-group облака — этого
+# скрипт сделать не может (зависит от провайдера).
 #
 # Для OpenAI-СОВМЕСТИМОГО провайдера (не api.openai.com) задайте ещё эндпоинт и модель:
 #   LLM_API_KEY=... \
@@ -37,7 +46,20 @@ fi
 docker info >/dev/null 2>&1 || { echo "ОШИБКА: демон Docker не запущен — откройте Docker Desktop." >&2; exit 1; }
 
 FRESH=0
-[[ "${1:-}" == "--fresh" ]] && FRESH=1
+SITE_OVERRIDE=""            # если задан --public/--public-ip → пропишем в SITE_ADDRESS
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --fresh) FRESH=1; shift ;;
+    --public)
+      [[ -n "${2:-}" ]] || { echo "ОШИБКА: --public требует хост, напр. --public chat.example.com" >&2; exit 1; }
+      SITE_OVERRIDE="$2"; shift 2 ;;
+    --public-ip)
+      [[ -n "${2:-}" ]] || { echo "ОШИБКА: --public-ip требует IPv4, напр. --public-ip 203.0.113.5" >&2; exit 1; }
+      [[ "$2" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "ОШИБКА: '$2' не похоже на IPv4-адрес" >&2; exit 1; }
+      SITE_OVERRIDE="$2.sslip.io"; shift 2 ;;   # sslip.io резолвит <ip>.sslip.io → <ip> → реальный TLS
+    *) echo "ОШИБКА: неизвестный аргумент '$1' (см. шапку скрипта)" >&2; exit 1 ;;
+  esac
+done
 
 gen() { openssl rand -hex "$1"; }        # hex — URL-safe, годится и для DSN, и для секрета
 
@@ -83,6 +105,13 @@ if [[ $need_secrets -eq 1 ]]; then
   [[ -n "${LLM_MODEL:-}"   ]] && set_kv LLM_MODEL   "$LLM_MODEL"
 fi
 
+# Публичный адрес: прописываем SITE_ADDRESS всегда, когда задан флаг (в т.ч. при повторном
+# запуске без --fresh — это осознанный override). Caddy по нему сам выпустит TLS-сертификат.
+if [[ -n "$SITE_OVERRIDE" ]]; then
+  set_kv SITE_ADDRESS "$SITE_OVERRIDE"
+  echo "→ SITE_ADDRESS=${SITE_OVERRIDE} — Caddy выпустит TLS (нужны открытые порты 80 и 443)"
+fi
+
 # Предупреждение, если ключ LLM так и не задан (регистрация/логин работают всё равно)
 if grep -qE '^LLM_API_KEY=(sk-\.\.\.)?$' .env; then
   echo "⚠  LLM_API_KEY не задан: регистрация и вход работать будут, но ответы модели — нет."
@@ -99,30 +128,47 @@ fi
 echo "→ сборка и запуск сервисов (первый раз может занять пару минут)…"
 $DC up --build -d
 
-# Ждём готовности через caddy → /healthz (503, пока Redis/Postgres не готовы; 200 — можно входить)
-URL="http://localhost"
-echo -n "→ жду готовности ${URL}/healthz "
+# Ждём готовности ВНУТРИ контейнера api (healthz=200 => Redis+Postgres живы). Проверяем не
+# через caddy: при публичном SITE_ADDRESS caddy отдаёт только этот хост и редиректит на HTTPS,
+# поэтому http://localhost его бы не прошёл. Заходим python-ом внутрь api к localhost:8000.
+echo -n "→ жду готовности сервисов "
 ready=0
 for i in $(seq 1 90); do
-  code="$(curl -s -o /dev/null -w '%{http_code}' "${URL}/healthz" 2>/dev/null || true)"
-  if [[ "$code" == "200" ]]; then ready=1; echo " ✓"; break; fi
+  if $DC exec -T api python -c \
+      "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz',timeout=3).getcode()==200 else 1)" \
+      >/dev/null 2>&1; then
+    ready=1; echo " ✓"; break
+  fi
   echo -n "."
   sleep 2
 done
 if [[ $ready -ne 1 ]]; then
   echo
-  echo "⚠  Не дождался healthz=200 за ~180с. Часто причина — занят порт 80 или ещё идёт сборка."
-  echo "   Логи:  $DC logs -f      Порт 80:  lsof -nP -iTCP:80 -sTCP:LISTEN"
+  echo "⚠  Не дождался готовности за ~180с. Часто причина — ещё идёт сборка, занят порт 80/443"
+  echo "   или упал api из-за конфига. Логи:  $DC logs -f"
   exit 1
 fi
 
 LLM_URL_EFF="$(grep -E '^LLM_API_URL=' .env | head -1 | cut -d= -f2-)"
 LLM_MODEL_EFF="$(grep -E '^LLM_MODEL=' .env | head -1 | cut -d= -f2-)"
+SITE_EFF="$(grep -E '^SITE_ADDRESS=' .env | head -1 | cut -d= -f2-)"
+
+# URL для показа: ":80"/пусто → локальный HTTP; иначе публичный хост по HTTPS.
+if [[ -z "$SITE_EFF" || "$SITE_EFF" == ":80" || "$SITE_EFF" == :* ]]; then
+  URL="http://localhost"
+  ACCESS_NOTE=" Другие в той же сети: http://<IP-этого-сервера>/  (откройте порт 80; без TLS —
+   пароли/токены идут открытым текстом, только для короткого показа своим)."
+else
+  URL="https://${SITE_EFF}"
+  ACCESS_NOTE=" Коллеги заходят по этому HTTPS-адресу. Сертификат Caddy выпустит сам при первом
+   обращении (пара секунд). Нужны открытые в облаке порты 80 И 443."
+fi
 
 cat <<EOF
 
 ======================================================================
  Готово. Откройте в браузере:   ${URL}/
+${ACCESS_NOTE}
 
  LLM-эндпоинт: ${LLM_URL_EFF}
  LLM-модель:   ${LLM_MODEL_EFF}
