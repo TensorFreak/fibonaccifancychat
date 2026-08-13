@@ -85,6 +85,7 @@ hb = asyncio.create_task(heartbeat_lock(             # продлеваем TTL 
 ### Шаг 1 — сохранить сообщение пользователя
 
 ```python
+await load_context(r, conversation_id)                               # Шаг 0: регидрировать окно из PG, ПОКА оно пусто
 await db.insert_message(conversation_id, "user", text, message_id)   # Postgres (истина), идемпотентно
 added = await append_context(r, conversation_id,
                              {"role": "user", "content": text, "mid": message_id})  # ctx
@@ -92,6 +93,8 @@ if added:                                                            # эхо т
     await _emit_event(r, conversation_id,
         {"type": "user_message", "content": text, "message_id": message_id})
 ```
+
+> **Шаг 0 обязателен и идёт ПЕРЕД `append_context`.** `load_context` тянет историю из Postgres только когда окно пусто (см. [05](05-hot-context.md)). Если сначала выполнить `append_context`, он положит текущее сообщение в протухшее окно, окно станет непустым, и регидратация НЕ сработает — в промпт уйдёт лишь текущее сообщение, а вся история выпадет. Симптом был: диалог «забывал всё» после `ctx_ttl` простоя (или моргания/эвикции Redis). На тёплом окне `load_context` проходит мгновенно (LRANGE непустой). Регрессия закрыта тестом `tests/test_context_rehydration.py`.
 
 Сообщение уходит в Postgres (навсегда, вставка идемпотентна по `message_id`), в горячее окно `ctx:{id}` (для промпта) и эхом в durable-ленту `events:{id}` — чтобы **другие** устройства пользователя увидели его реплику (и переиграли на реконнекте). Эхо шлётся **только если** сообщение реально добавилось в окно (`added`), иначе на ретрае был бы дубль у клиента. `_emit_event` = `XADD` в `events:{id}` с `MAXLEN ~` + `EXPIRE` (заменил прежний Pub/Sub `publish`). Про `append_context` — см. [05. Горячий контекст](05-hot-context.md).
 

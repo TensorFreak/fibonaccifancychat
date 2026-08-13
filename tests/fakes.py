@@ -7,11 +7,37 @@
 class FakeRedis:
     def __init__(self):
         self.store: dict[str, str] = {}
+        self.lists: dict[str, list[str]] = {}     # горячее окно ctx:{id} и т.п.
         self.xadds: list[tuple[str, dict]] = []   # (stream, fields) для проверок
         self.acked: list[str] = []
 
     async def get(self, key):
         return self.store.get(key)
+
+    # --- списки (горячее окно): семантика Redis для отрицательных индексов ---
+    @staticmethod
+    def _slice(lst, start, end):
+        n = len(lst)
+        if start < 0:
+            start = max(n + start, 0)
+        if end < 0:
+            end = n + end
+        if end >= n:
+            end = n - 1
+        if n == 0 or start > end:
+            return []
+        return lst[start:end + 1]
+
+    async def lrange(self, key, start, end):
+        return list(self._slice(self.lists.get(key, []), start, end))
+
+    async def rpush(self, key, *values):
+        self.lists.setdefault(key, []).extend(str(v) for v in values)
+        return len(self.lists[key])
+
+    async def ltrim(self, key, start, end):
+        self.lists[key] = list(self._slice(self.lists.get(key, []), start, end))
+        return True
 
     async def set(self, key, value, nx=False, ex=None):
         if nx and key in self.store:
