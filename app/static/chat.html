@@ -107,6 +107,7 @@ const bubbles = {};                                 // message_id -> элеме�
 let lastEventId = "$";                              // курсор ленты событий (догон на реконнекте)
 let seenUser = new Set();                           // message_id эх user_message (идемпотентность)
 let reconnectAttempts = 0;                          // для бэкоффа+джиттера реконнекта (N1-review)
+const drafts = {};                                  // conversation_id -> недоотправленный текст ввода
 
 function authHeaders(){ return {"Authorization":"Bearer "+token, "Content-Type":"application/json"}; }
 async function api(path, opts={}){
@@ -212,9 +213,17 @@ async function selectChat(id){
   // Иначе он остаётся открытым всё время запроса истории и рендерит свои токены в новый
   // чат (утечка стрима между диалогами).
   teardownWs();
+  // ЧЕРНОВИК per-conversation: composer #text — ОДИН глобальный элемент на все чаты, поэтому
+  // недоотправленный текст сам по себе виден под каждым диалогом. Скоупим его по id: при
+  // уходе сохраняем текст текущего чата, при входе восстанавливаем текст целевого (или пусто).
+  if(activeId != null) drafts[activeId] = $("text").value;
   activeId = id;
   const it = items.find(x => x.id===id);
   $("title").textContent = (it && it.title) || "Новый чат";
+  const ta = $("text");
+  ta.value = drafts[id] || "";
+  ta.style.height = "auto";
+  if(ta.value) ta.style.height = ta.scrollHeight + "px";   // вернуть авто-высоту под черновик
   renderSidebar();
   await loadHistory(id);   // сначала история -> получаем events_cursor (снапшот)
   if(activeId === id) connect(id);   // затем тейл событий СТРОГО после снапшота
@@ -336,6 +345,7 @@ function send(){
   if(!text || !ws || ws.readyState !== 1) return;
   ws.send(JSON.stringify({text}));       // свой пузырь придёт из эха user_message
   t.value=""; t.style.height="auto";
+  delete drafts[activeId];               // черновик отправлен — убрать сохранённый
 }
 $("send").onclick = send;
 $("text").addEventListener("keydown", (e)=>{ if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); } });
