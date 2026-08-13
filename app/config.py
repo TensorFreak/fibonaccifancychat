@@ -254,7 +254,11 @@ class Settings(BaseSettings):
     llm_write_timeout: float = 30.0
 
     # --- Авто-название диалога (отдельный LLM-запрос) ---
-    title_max_tokens: int = 24          # название короткое
+    # Потолок ответа для заголовка. Само название — 3–5 слов, но у reasoning-моделей
+    # (напр. deepseek-reasoner) бюджет сперва уходит в reasoning_content, и при слишком
+    # малом лимите на видимый content не остаётся токенов -> пустой заголовок и фолбэк на
+    # первое сообщение (см. generate_title). 100 даёт таким моделям шанс дойти до ответа.
+    title_max_tokens: int = 100
     # dedup: помечаем, что название уже запрошено, чтобы не дёргать LLM каждый ход.
     title_enqueue_ttl_seconds: int = 86400
 
