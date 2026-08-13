@@ -102,10 +102,13 @@ async def fold(old_summary, messages):
                                         f"Новые сообщения:\n{render(chunk)}\n\n"
                                         f"Обновлённое резюме:"},
         ]
-        summary = await complete(prompt, max_tokens=settings.summary_max_tokens)
-        summary = tokens.truncate_text(summary, settings.summary_max_tokens)  # предохранитель
+        result = await complete(prompt, max_tokens=settings.summary_max_tokens)
+        if result and result.strip():                         # пустой ответ НЕ затираем накопленным
+            summary = tokens.truncate_text(result, settings.summary_max_tokens)  # предохранитель длины
     return summary or ""
 ```
+
+> **Пустой ответ модели не обнуляет резюме.** Если `complete()` на каком-то чанке вернул пусто (сбой/фильтр), мы НЕ перезаписываем `summary` пустой строкой — иначе следующий чанк свернулся бы поверх «(пусто)», а `old_summary` и уже свёрнутые чанки пропали бы (при этом watermark в `summarize()` всё равно сдвигается — сообщения считались бы свёрнутыми). Пропускаем проблемный чанк, сохраняя прежнее `summary`: деградация локальна (один чанк), а не тотальна. Регрессия — в `tests/test_summarize_fold.py`.
 
 Три уровня контроля длины (см. [08. Контроль длины](08-token-budget.md)):
 

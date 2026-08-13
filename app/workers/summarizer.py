@@ -70,10 +70,16 @@ async def fold(old_summary: str | None, messages: list[dict]) -> str:
                         f"Новые сообщения:\n{render(chunk)}\n\n"
                         f"Обновлённое резюме:"},
         ]
-        summary = await complete(prompt, max_tokens=settings.summary_max_tokens)
-        # предохранитель от модели, проигнорившей инструкцию про длину
-        summary = await asyncio.to_thread(
-            tokens.truncate_text, summary, settings.summary_max_tokens)
+        result = await complete(prompt, max_tokens=settings.summary_max_tokens)
+        # Пустой ответ модели (сбой/фильтр/пустая генерация) НЕ затираем накопленным.
+        # Иначе следующий чанк свернулся бы поверх «(пусто)», а old_summary и уже свёрнутые
+        # ранее чанки пропали бы — при том что watermark в summarize() всё равно сдвинется
+        # (сообщения считались бы свёрнутыми). Пропускаем проблемный чанк, сохраняя прежнее
+        # summary: деградация локальна (потеря одного чанка), а не тотальна (потеря всего).
+        if result and result.strip():
+            # предохранитель от модели, проигнорившей инструкцию про длину
+            summary = await asyncio.to_thread(
+                tokens.truncate_text, result, settings.summary_max_tokens)
     return summary or ""
 
 
